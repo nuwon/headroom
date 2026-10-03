@@ -19,6 +19,11 @@ history grows only on change.
   anchor item. With ``previous_response_id`` the server holds history, so only
   the new block is appended and nothing is replayed.
 
+A memo entry also records the per-section digests of the full state it
+stands for and whether its text was a full block or a delta, so the service
+can tell whether a delta's base is still present in this request's history
+(:meth:`StickyInjector.live_positions`).
+
 Anchors are hashed in a canonical form (``cache_control`` removed) so the
 client moving its breakpoint does not orphan an anchor. A memo entry whose
 anchor no longer matches (compaction, edited history) is skipped, never
@@ -58,15 +63,37 @@ class MemoEntry:
     anchor: str
     text: str
     state_hash: str
+    digests: str = ""  # full-state section digests as of this entry
+    full: bool = True  # False: ``text`` is a delta on the entries before it
+    revision: str = ""
 
     def to_json(self) -> list[Any]:
-        return [self.index, self.anchor, self.text, self.state_hash]
+        return [
+            self.index,
+            self.anchor,
+            self.text,
+            self.state_hash,
+            self.digests,
+            self.full,
+            self.revision,
+        ]
 
     @classmethod
     def from_json(cls, raw: Any) -> MemoEntry | None:
         try:
-            index, anchor, text, state_hash = raw
-            return cls(int(index), str(anchor), str(text), str(state_hash))
+            if len(raw) == 4:  # written before delta blocks existed: full blocks
+                index, anchor, text, state_hash = raw
+                return cls(int(index), str(anchor), str(text), str(state_hash))
+            index, anchor, text, state_hash, digests, full, revision = raw
+            return cls(
+                int(index),
+                str(anchor),
+                str(text),
+                str(state_hash),
+                str(digests),
+                bool(full),
+                str(revision),
+            )
         except (TypeError, ValueError):
             return None
 
@@ -93,6 +120,15 @@ class StickyInjector:
     def entries(self, session_key: str) -> list[MemoEntry]:
         with self._lock:
             return list(self._memo.get(session_key, ()))
+
+    def live_positions(self, session_key: str, history: list[Any]) -> list[int]:
+        """Positions (in memo order) of the entries whose anchor is in ``history``."""
+        out: list[int] = []
+        for pos, entry in enumerate(self.entries(session_key)):
+            i = entry.index
+            if 0 <= i < len(history) and anchor_hash(history[i]) == entry.anchor:
+                out.append(pos)
+        return out
 
     def last_state_hash(self, session_key: str) -> str:
         entries = self.entries(session_key)
@@ -121,6 +157,9 @@ class StickyInjector:
         state_hash: str,
         *,
         only_if_orphaned: bool = False,
+        digests: str = "",
+        full: bool = True,
+        revision: str = "",
     ) -> tuple[list[dict[str, Any]], PendingInjection] | None:
         """Return ``(messages, pending)`` or None when nothing changes.
 
@@ -144,7 +183,13 @@ class StickyInjector:
             last = len(outgoing) - 1
             if outgoing[last].get("role") == "user":
                 new_entry = MemoEntry(
-                    last, anchor_hash(client_messages[last]), new_block, state_hash
+                    last,
+                    anchor_hash(client_messages[last]),
+                    new_block,
+                    state_hash,
+                    digests,
+                    full,
+                    revision,
                 )
                 if new_entry.text not in plan.get(last, []):
                     plan.setdefault(last, []).append(new_block)
@@ -177,6 +222,9 @@ class StickyInjector:
         *,
         incremental: bool,
         only_if_orphaned: bool = False,
+        digests: str = "",
+        full: bool = True,
+        revision: str = "",
     ) -> tuple[list[Any], PendingInjection] | None:
         if len(client_items) != len(outgoing):
             return None
@@ -193,7 +241,15 @@ class StickyInjector:
             new_block = None
         if new_block and outgoing:
             last = len(outgoing) - 1
-            new_entry = MemoEntry(last, anchor_hash(client_items[last]), new_block, state_hash)
+            new_entry = MemoEntry(
+                last,
+                anchor_hash(client_items[last]),
+                new_block,
+                state_hash,
+                digests,
+                full,
+                revision,
+            )
             if new_block in plan.get(last, []):
                 new_entry = None
             else:

@@ -1187,6 +1187,26 @@ class AnthropicHandlerMixin:
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
+            # Phase 2 agent state (task state, evidence, contracts, scope, test
+            # impact, workflows): ingest this request's history as events, off
+            # the event loop. Fail-open: None leaves the request untouched.
+            _agent_state_rs = None
+            _agent_state = getattr(self, "agent_state", None)
+            if _agent_state is not None and not _bypass:
+                from headroom.intelligence.agent_state.runtime import anthropic_cwd
+
+                _agent_state_cwd = anthropic_cwd(body, request.headers)
+                if _agent_state_cwd:
+                    _agent_state_rs = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        lambda: _agent_state.begin_anthropic(
+                            body,
+                            request.headers,
+                            original_client_messages,
+                            cwd=_agent_state_cwd,
+                        ),
+                    )
+
             # Cost-aware model routing (#1706). Opt-in and disabled by default;
             # fail-closed and bypass handling live in the helper. A model override
             # comes from a provider URL (for example Vertex rawPredict), where
@@ -3518,6 +3538,35 @@ class AnthropicHandlerMixin:
                 (time.perf_counter() - pre_upstream_started_at) * 1000.0,
             )
 
+            # Phase 2 agent state: one compact <headroom_agent_state> block in the
+            # live turn, plus byte-identical replay of earlier insertions so the
+            # cached prefix never changes. The prefix tracker keeps recording the
+            # insertion-free messages; the replay restores identical wire bytes.
+            # optimize=False means "never mutate the request": ingest only.
+            if _agent_state_rs is not None and not self.config.optimize:
+                _agent_state_rs = None
+            if _agent_state_rs is not None:
+                _agent_state_messages = _agent_state.apply_anthropic(
+                    _agent_state_rs, original_client_messages, body["messages"]
+                )
+                if _agent_state_messages is not None:
+                    from headroom.proxy.body_forwarding import (
+                        outbound_body_is_client_bytes as _as_locked,
+                    )
+
+                    _agent_state_previous = body["messages"]
+                    body["messages"] = _agent_state_messages
+                    if _as_locked(body=body, original_body_bytes=original_body_bytes):
+                        # Signed-thinking passthrough would discard the edit.
+                        body["messages"] = _agent_state_previous
+                        _agent_state_rs = None
+                    else:
+                        body_mutation_tracker.mark_mutated("agent_state")
+                        transforms_applied.extend(_agent_state_rs.labels)
+                        _agent_state.commit(_agent_state_rs)
+                else:
+                    _agent_state_rs = None
+
             # Anthropic wire-contract guard (issue #765). Any transform or
             # pipeline extension above may have left a ``role="system"`` entry
             # in ``messages`` (e.g. a harness system block relocated during
@@ -4003,6 +4052,8 @@ class AnthropicHandlerMixin:
                     original_body_bytes=original_body_bytes,
                 )
                 if final_locked_to_client_bytes and body_mutation_tracker.mutated:
+                    if _agent_state_rs is not None:
+                        _agent_state.discard(_agent_state_rs)
                     discarded_reasons = body_mutation_tracker.reasons
                     try:
                         wire_body = json.loads(original_body_bytes or b"")

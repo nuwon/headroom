@@ -38,7 +38,7 @@ AGENTS = {"claude": "claude_code", "claude_code": "claude_code", "codex": "codex
 
 def handle_pretool(service: Any, payload: dict[str, Any]) -> dict[str, Any]:
     agent = AGENTS.get(str(payload.get("agent") or "").lower(), "")
-    hook = payload.get("hook") if isinstance(payload.get("hook"), dict) else {}
+    hook: dict[str, Any] = payload["hook"] if isinstance(payload.get("hook"), dict) else {}
     which = payload.get("which") if isinstance(payload.get("which"), dict) else None
     cwd = str(hook.get("cwd") or payload.get("cwd") or "")
     tool_name = str(hook.get("tool_name") or "")

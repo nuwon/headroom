@@ -5,6 +5,15 @@ headroom intelligence status    # resolved feature flags + service state
 headroom intelligence doctor    # live protocol checks against the running service
 headroom intelligence stop      # stop a Headroom-owned llama-server
 headroom intelligence gateway   # serve /v1/systemone on 127.0.0.1 (for Rust/other tools)
+
+Phase 2 agent-state diagnostics (read-only; ``verify --run`` executes on request):
+
+headroom intelligence state      # task id, revision, compact task state
+headroom intelligence evidence   # claim heads, sources, status, confidence (--claim KEY)
+headroom intelligence contracts  # tool families, learned rules, capability matrix
+headroom intelligence scope      # change contract, task-owned changes, warnings
+headroom intelligence verify     # risk, verification tiers, reasons (--run to execute)
+headroom intelligence workflows  # candidate / promoted / disabled macros
 """
 
 from __future__ import annotations
@@ -233,3 +242,209 @@ def intelligence_gateway(port: int) -> None:
         from headroom.intelligence.jevk5_service import stop_all_owned
 
         stop_all_owned()
+
+
+# ------------------------------------------------------------ agent state
+# Phase 2 diagnostics. Read-only unless ``verify --run`` is given explicitly.
+
+
+def _agent_state_rt(project: str | None, session: str | None):  # type: ignore[no-untyped-def]
+    from headroom.intelligence.agent_state import diagnostics
+    from headroom.intelligence.agent_state.config import AgentStateConfigError
+
+    try:
+        rt = diagnostics.runtime(project, session)
+    except AgentStateConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if rt is None:
+        raise click.ClickException("agent-state store is unavailable for this project")
+    return rt
+
+
+def _emit(data: dict[str, Any], json_output: bool, render) -> None:  # type: ignore[no-untyped-def]
+    if json_output:
+        click.echo(json.dumps(data, indent=2, default=str))
+        return
+    for key in ("project", "session", "database"):
+        click.echo(f"{key}: {data.get(key)}")
+    render(data)
+
+
+_project_opt = click.option("--project", default=None, help="Project directory (default: cwd).")
+_session_opt = click.option(
+    "--session", default=None, help="Agent session id (default: most recent)."
+)
+_json_opt = click.option("--json", "json_output", is_flag=True)
+
+
+@intelligence_group.command("state")
+@_project_opt
+@_session_opt
+@_json_opt
+def intelligence_state(project: str | None, session: str | None, json_output: bool) -> None:
+    """Current task id, revision and compact task state."""
+    from headroom.intelligence.agent_state import diagnostics
+
+    def render(d: dict[str, Any]) -> None:
+        task = d.get("task")
+        if not task:
+            click.echo("task: none observed yet")
+            return
+        click.echo(f"task: {task['task_id']} revision={task['revision']} status={task['status']}")
+        for sec in d.get("sections", []):
+            click.echo(f"{sec['heading']}:")
+            for line in sec["lines"]:
+                click.echo(f"  {line}")
+
+    _emit(diagnostics.state(_agent_state_rt(project, session)), json_output, render)
+
+
+@intelligence_group.command("evidence")
+@_project_opt
+@_session_opt
+@click.option("--claim", default=None, help="Exact claim key, e.g. 'tests_passing|latest'.")
+@click.option("--limit", default=20, show_default=True, type=int)
+@_json_opt
+def intelligence_evidence(
+    project: str | None, session: str | None, claim: str | None, limit: int, json_output: bool
+) -> None:
+    """Current claim heads with source, status and confidence."""
+    from headroom.intelligence.agent_state import diagnostics
+
+    def render(d: dict[str, Any]) -> None:
+        for r in d.get("records", []):
+            click.echo(
+                f"  {r['id']} [{r['status']}/{r['source']} {r['confidence']:.2f}] {r['claim']}: {r['text']}"
+            )
+        for c in d.get("conflicts", []):
+            click.echo(f"  conflict: {c['low']} contradicted by {c['high']}")
+
+    _emit(
+        diagnostics.evidence(_agent_state_rt(project, session), claim=claim, limit=limit),
+        json_output,
+        render,
+    )
+
+
+@intelligence_group.command("contracts")
+@_project_opt
+@_session_opt
+@_json_opt
+def intelligence_contracts(project: str | None, session: str | None, json_output: bool) -> None:
+    """Tool families, learned rules and the enforcement capability matrix."""
+    from headroom.intelligence.agent_state import diagnostics
+
+    def render(d: dict[str, Any]) -> None:
+        click.echo(f"modes: {d['modes']}")
+        click.echo("capabilities:")
+        for k, v in d["capabilities"].items():
+            click.echo(f"  {k}: {v}")
+        click.echo("learned rules:")
+        for r in d["learned_rules"] or [
+            {
+                "rule_id": "-",
+                "executable": "",
+                "subcommand": "",
+                "reason": "none",
+                "failures": 0,
+                "disabled_reason": None,
+            }
+        ]:
+            click.echo(
+                f"  {r['rule_id']} {r['executable']} {r['subcommand']} {r['reason']} x{r['failures']} {r['disabled_reason'] or ''}"
+            )
+        for v in d["recent_validations"]:
+            click.echo(
+                f"  {v['tool_name']}: {v['outcome']} ({v['enforced']}, {v['source']}) {v['reason']}"
+            )
+
+    _emit(diagnostics.contracts(_agent_state_rt(project, session)), json_output, render)
+
+
+@intelligence_group.command("scope")
+@_project_opt
+@_session_opt
+@_json_opt
+def intelligence_scope(project: str | None, session: str | None, json_output: bool) -> None:
+    """Change contract, task-owned changes, warnings and expansions."""
+    from headroom.intelligence.agent_state import diagnostics
+
+    def render(d: dict[str, Any]) -> None:
+        c = d.get("contract")
+        if not c:
+            click.echo("contract: none")
+            return
+        click.echo(f"mode: {c['mode']}  class: {c['task_class']}  budget: {c['max_change_budget']}")
+        click.echo(f"in scope: {', '.join(c['explicit_in_scope_paths']) or '-'}")
+        click.echo(f"excluded: {', '.join(c['explicit_out_of_scope_paths']) or '-'}")
+        click.echo(f"subsystems: {', '.join(c['expected_subsystems']) or '-'}")
+        for path, cls in d.get("changes", []):
+            click.echo(f"  changed {path}: {cls}")
+        for e in d.get("expansions", []):
+            click.echo(f"  expansion {e['path']}: {e['reason_code']} ({e['confidence']})")
+        for w in d.get("warnings", []):
+            click.echo(f"  warning {w['path']}: {w['reason']}")
+
+    _emit(diagnostics.scope(_agent_state_rt(project, session)), json_output, render)
+
+
+@intelligence_group.command("verify")
+@_project_opt
+@_session_opt
+@click.option(
+    "--run", "run_plan", is_flag=True, help="Execute the staged plan (default: inspect only)."
+)
+@click.option("--max-tier", type=click.IntRange(1, 3), default=None)
+@_json_opt
+def intelligence_verify(
+    project: str | None,
+    session: str | None,
+    run_plan: bool,
+    max_tier: int | None,
+    json_output: bool,
+) -> None:
+    """Risk score, selected verification tiers and reason codes."""
+    from headroom.intelligence.agent_state import diagnostics
+
+    def render(d: dict[str, Any]) -> None:
+        plan = d.get("plan")
+        if not plan:
+            click.echo(f"plan: none ({d.get('reason', 'planner disabled')})")
+            return
+        click.echo(
+            f"risk: {plan['risk_score']}  max tier: {plan['max_tier']}  changed: {', '.join(plan['changed'])}"
+        )
+        for tier, cmds in sorted(plan["commands"].items()):
+            for c in cmds:
+                click.echo(f"  tier {tier}: {' '.join(c['argv'])}")
+        click.echo(f"reasons: {', '.join(plan['rationale_codes']) or '-'}")
+        if "result" in d:
+            click.echo(
+                f"result: {d['result'].get('status')} tiers={[t['tier'] for t in d['result'].get('tiers', [])]}"
+            )
+
+    _emit(
+        diagnostics.verify(_agent_state_rt(project, session), run=run_plan, max_tier=max_tier),
+        json_output,
+        render,
+    )
+
+
+@intelligence_group.command("workflows")
+@_project_opt
+@_session_opt
+@_json_opt
+def intelligence_workflows(project: str | None, session: str | None, json_output: bool) -> None:
+    """Candidate, promoted and disabled workflow macros, and why."""
+    from headroom.intelligence.agent_state import diagnostics
+
+    def render(d: dict[str, Any]) -> None:
+        for m in d["macros"]:
+            state = "enabled" if m["enabled"] else f"disabled ({m['disabled_reason']})"
+            click.echo(f"  {m['name']} [{m['origin']}/{m['safety']}] {state}: {m['description']}")
+        for c in d["candidates"]:
+            click.echo(
+                f"  candidate {c['signature']}: {c['observations']} obs, {c['sessions']} sessions, {c['safety']} :: {' -> '.join(c['steps'])}"
+            )
+
+    _emit(diagnostics.workflows(_agent_state_rt(project, session)), json_output, render)

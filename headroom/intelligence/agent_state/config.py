@@ -208,10 +208,10 @@ class AgentStateConfig:
             "workflows",
         ):
             if key in data:
-                kwargs[key] = FeatureMode(str(data[key]))
+                kwargs[key] = FeatureMode(getattr(data[key], "value", data[key]))
         for key in ("scope_mode", "contract_mode"):
             if key in data:
-                kwargs[key] = EnforcementMode(str(data[key]))
+                kwargs[key] = EnforcementMode(getattr(data[key], "value", data[key]))
         for key in (
             "max_tokens",
             "workflow_min_observations",

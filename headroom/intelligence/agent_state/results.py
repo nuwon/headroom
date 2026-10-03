@@ -24,6 +24,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 _EXIT_RES = (
     re.compile(r"(?im)^\s*Exit code:?\s*(-?\d+)\b"),
@@ -126,7 +127,7 @@ _GO_PASS_RE = re.compile(r"(?m)^--- PASS: (\S+)")
 _GO_PKG_RE = re.compile(r"(?m)^(ok|FAIL)\s+(\S+)")
 
 
-def _last(iterator):  # noqa: ANN001, ANN202
+def _last(iterator: Any) -> Any:
     last = None
     for last in iterator:  # noqa: B007
         pass

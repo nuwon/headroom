@@ -159,9 +159,9 @@ def _values_agree(a: Any, b: Any) -> bool:
         if "ok" in a and "ok" in b:
             return bool(a["ok"]) == bool(b["ok"])
         if "state" in a and "state" in b:
-            return a["state"] == b["state"]
-        return a == b
-    return a == b
+            return bool(a["state"] == b["state"])
+        return bool(a == b)
+    return bool(a == b)
 
 
 class EvidenceLedger:
@@ -314,7 +314,7 @@ class EvidenceLedger:
                 )
             return new
 
-        out = self.store.write(run)
+        out: EvidenceRecord | None = self.store.write(run)
         if out is not None and out.created_at == rec.created_at:
             self.created += 1
             self.rt.metrics.bump("evidence_records_created")
@@ -491,7 +491,7 @@ class EvidenceLedger:
         return [r for r in (self.record(rec) for rec in out) if r is not None]
 
     def _rel(self, path: str) -> str:
-        return self.rt.workspace.relpath(path)
+        return str(self.rt.workspace.relpath(path))
 
     def _filesystem(self, ev: AgentEvent, inv: ToolInvocation, text: str) -> list[EvidenceRecord]:
         out = []

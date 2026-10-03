@@ -527,7 +527,7 @@ class WorkflowCompiler:
                 k += 1
                 if any(c is None for c in column):
                     return None
-                distinct = sorted(set(column))
+                distinct = sorted({str(c) for c in column})
                 if len(distinct) == 1:
                     if not _valid_project_path(distinct[0], root, must_exist=False):
                         return None
@@ -973,7 +973,7 @@ class WorkflowExecutor:
         if plan is None:
             return {"status": "nothing_to_verify", "reason": "no task-owned changes"}
         max_tier = 1 if "tier1" in step.argument_template else None
-        out = planner.run_plan(plan, max_tier=max_tier)
+        out: dict[str, Any] = planner.run_plan(plan, max_tier=max_tier)
         passed = sum(t.get("passed", 0) for t in out.get("tiers", []))
         failed = sum(t.get("failed", 0) for t in out.get("tiers", []))
         out["passed"], out["failed"] = passed, failed
@@ -991,6 +991,7 @@ class WorkflowExecutor:
         self, step: WorkflowStep, argv: list[str]
     ) -> tuple[ToolInvocation, dict[str, Any]]:
         root = self.rt.workspace.root
+        raw: dict[str, Any]
         if step.native == "read":
             raw = {"file_path": resolve(argv[1], cwd=root)}
             return normalize_tool_call("Read", raw, default_cwd=root), raw
@@ -1114,8 +1115,8 @@ class WorkflowExecutor:
         if step.native == "list":
             import glob as _glob
 
-            hits = sorted(_glob.glob(os.path.join(scope, pattern), recursive=True))[:200]
-            return "\n".join(relative_to_root(h, root) for h in hits), True, 0
+            listed = sorted(_glob.glob(os.path.join(scope, pattern), recursive=True))[:200]
+            return "\n".join(relative_to_root(h, root) for h in listed), True, 0
         try:
             rx = re.compile(pattern)
         except re.error as exc:

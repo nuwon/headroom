@@ -381,9 +381,13 @@ def test_verify_section_injected_only_when_actionable(service, repo: Path) -> No
     convo.edit("src/pkg/iface.py")
     rs = send(service, convo)
     assert "verify:" not in (rs.block or "")
-    convo.bash("python -m pytest -q tests/test_core.py", PYTEST_PASS)
+    convo.bash("python -m pytest -q tests/test_core.py", PYTEST_PASS)  # the wrong tests
     rs = send(service, convo)
-    assert "verify:" in rs.block and "tests/test_iface.py" in rs.block and len(rs.block) // 4 < 1200
+    assert "verify:" not in (rs.block or "")  # mid-iteration: no plan spam
+    convo.say("Done, the fix is complete.")  # completion claimed without tier-1 evidence
+    rs = send(service, convo)
+    assert "verify:" in rs.block and "now:" in rs.block and "tests/test_iface.py" in rs.block
+    assert len(rs.block) // 4 < 1200
 
 
 def test_phase6_gate_escalation(service, repo: Path) -> None:

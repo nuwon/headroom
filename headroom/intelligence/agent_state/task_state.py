@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
@@ -465,7 +466,7 @@ def apply_transition(
 # ------------------------------------------------------------- extraction
 _CODE_FENCE_RE = re.compile(r"(?s)```.*?(?:```|$)")
 _BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|\[[ xX]\])\s+")
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+(?=[A-Z0-9`\"'(])")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9`\"'(])|;\s+")
 
 _CRITERION_RE = re.compile(
     r"(?i)\b(?:tests? (?:should|must|need to|needs to|have to|has to|will) (?:still )?pass"
@@ -603,6 +604,31 @@ def _clip(text: str, limit: int) -> str:
     return cut.rstrip(",;:") + " …"
 
 
+def _goal_line(goal: str, atoms: Iterable[Any]) -> str:
+    """The goal without the sentences that are already their own atom.
+
+    The first message usually states the constraints and acceptance criteria
+    too, and those are listed under their own headings. Repeating them on the
+    goal line only costs tokens. Kept sentences stay verbatim and in order;
+    superseded atoms count too, so a corrected constraint does not resurface
+    here. If every sentence is an atom, the goal is shown unchanged.
+    """
+    keys = {
+        a.normalized_key
+        for a in atoms
+        if a.kind in (AtomKind.CONSTRAINT, AtomKind.CRITERION, AtomKind.DECISION)
+    }
+    if not keys:
+        return goal
+    kept: list[str] = []
+    for unit, _bullet in split_units(goal):
+        bare = _LABEL_PREFIX_RE.sub("", unit.strip(), count=1)
+        if normalize_key(_clip(bare, _ATOM_MAX_CHARS)) in keys:
+            continue
+        kept.append(unit.strip())
+    return " ".join(kept) if kept else goal
+
+
 def goal_text(message: str) -> str:
     """The user's own words: first paragraph, verbatim, clipped on a word boundary."""
     body = _strip_code(message).strip()
@@ -619,8 +645,14 @@ class ExtractedUnit:
     targets: tuple[str, ...] = ()
 
 
+_LABEL_PREFIX_RE = re.compile(
+    r"(?i)^\s*(?:constraints?|requirements?|rules?|notes?|important|acceptance criteria|criteria|goals?"
+    r"|context|also|additionally)\s*[:\-\u2013]\s+"
+)
+
+
 def classify_unit(text: str, *, bullet: bool, in_goal_message: bool) -> ExtractedUnit | None:
-    t = text.strip()
+    t = _LABEL_PREFIX_RE.sub("", text.strip(), count=1)
     if len(t) < 6:
         return None
     if _CRITERION_RE.search(t) and not (_NEGATIVE_RE.search(t) and not _TEST_WORD_RE.search(t)):
@@ -684,6 +716,21 @@ class TaskStateCompiler:
         except (KeyError, ValueError, TypeError):
             logger.debug("task state unreadable; starting fresh", exc_info=True)
             self.state = None
+
+    def refresh(self) -> None:
+        """Reload when another process (the MCP macro executor) advanced the task."""
+        if self.state is None:
+            self._load()
+            return
+        row = self.store.query_one(
+            "SELECT revision, state_json FROM tasks WHERE task_id = ?", (self.state.task_id,)
+        )
+        newer = self.store.query_one(
+            "SELECT task_id FROM tasks WHERE session_key = ? AND updated_at > ? AND task_id != ? LIMIT 1",
+            (self.rt.session_key, self.state.updated_at, self.state.task_id),
+        )
+        if newer is not None or (row is not None and int(row["revision"]) > self.state.revision):
+            self._load()
 
     def _commit(self, new: TaskState, transitions: list[StateTransition]) -> None:
         state_json = dumps(new.to_json())
@@ -1121,7 +1168,7 @@ class TaskStateCompiler:
             bool(inv is not None and (inv.paths_written or inv.paths_deleted))
             and ev.success is not False
         )
-        if wrote:
+        if wrote and inv is not None:
             # A task-owned change invalidates earlier verification of factual criteria.
             for crit in state.acceptance_criteria:
                 if crit.verify in ("test", "build") and crit.state is AtomState.SATISFIED:
@@ -1376,7 +1423,7 @@ class TaskStateCompiler:
             out.append((20, "constraints", cons))
         goal = state.primary_goal
         if goal is not None:
-            out.append((30, "goal", [goal.text]))
+            out.append((30, "goal", [_goal_line(goal.text, state.atoms)]))
         pending = [
             f"- {a.label} {a.text}"
             for a in state.acceptance_criteria

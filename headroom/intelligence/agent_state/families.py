@@ -604,12 +604,12 @@ def classify_segment(segment: str) -> CommandSegment:
     if exe in _DELETE_EXES:
         return seg(SafetyClass.MUTATING, "delete", deletes=tuple(_path_args(list(argv))))
     if exe in _WRITE_EXES:
-        targets = tuple(_path_args(list(argv)))
+        paths = tuple(_path_args(list(argv)))
         if exe in ("mv", "move", "move-item", "mi", "rename-item", "ren"):
-            return seg(SafetyClass.MUTATING, "write", writes=targets[-1:], deletes=targets[:-1])
+            return seg(SafetyClass.MUTATING, "write", writes=paths[-1:], deletes=paths[:-1])
         if exe in ("cp", "copy", "copy-item", "cpi", "xcopy", "robocopy"):
-            return seg(SafetyClass.MUTATING, "write", writes=targets[-1:])
-        return seg(SafetyClass.MUTATING, "write", writes=targets)
+            return seg(SafetyClass.MUTATING, "write", writes=paths[-1:])
+        return seg(SafetyClass.MUTATING, "write", writes=paths)
     if exe in _NETWORK_EXES:
         return seg(SafetyClass.EXTERNAL_SIDE_EFFECT, "network")
     if exe == "git":

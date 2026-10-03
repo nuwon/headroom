@@ -19,6 +19,7 @@
     "agent-orchestration",
     "context-management",
     "context-intelligence",
+    "agent-state",
     "---Memory---",
     "memory",
     "shared-context",

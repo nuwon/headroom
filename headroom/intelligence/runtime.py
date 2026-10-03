@@ -195,6 +195,20 @@ class IntelligenceRuntime:
                     from dataclasses import replace
 
                     task = replace(task, graph_neighbors=tuple(dict.fromkeys(neighbors))[:24])
+            # Phase 2: the TaskState view (in-scope paths, task-owned changes)
+            # joins the exact terms; TaskState itself stays session-scoped.
+            from .agent_state.runtime import task_state_terms
+
+            state_terms = task_state_terms(messages)
+            if state_terms:
+                from dataclasses import replace as _replace
+
+                task = _replace(
+                    task,
+                    explicit_entities=tuple(dict.fromkeys((*task.explicit_entities, *state_terms)))[
+                        :48
+                    ],
+                )
             out["task_context"] = task
             if self.config.task_query:
                 query = task.relevance_query()

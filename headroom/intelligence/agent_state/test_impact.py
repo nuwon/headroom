@@ -51,6 +51,9 @@ from .store import dumps, loads
 
 logger = logging.getLogger(__name__)
 
+# A source module whose name matches ``test_*.py``: never collect it as tests.
+__test__ = False
+
 EDGE_WEIGHTS = {
     "PROJECT_RULE": 1.00,
     "COVERAGE": 0.95,
@@ -135,6 +138,25 @@ class CommandSpec:
 
     def display(self) -> str:
         return display_argv(self.argv)
+
+    def brief(self, root: str) -> str:
+        """The model-facing form: an executable inside ``root`` is shown relative to it.
+
+        The command runs from ``root``, so ``.venv/bin/python3`` (or
+        ``.venv\\Scripts\\python.exe``) is equivalent and much shorter.
+        """
+        argv = list(self.argv)
+        same_cwd = os.path.normcase(os.path.abspath(self.cwd)) == os.path.normcase(
+            os.path.abspath(root)
+        )
+        if argv and same_cwd and os.path.isabs(argv[0]):
+            try:
+                rel = os.path.relpath(argv[0], root)
+            except ValueError:  # a different drive on Windows
+                rel = ""
+            if rel and not rel.startswith(".."):
+                argv[0] = rel
+        return display_argv(argv)
 
 
 @dataclass
@@ -1024,7 +1046,7 @@ class TestImpactPlanner:
 
     @property
     def root(self) -> str:
-        return self.rt.workspace.root
+        return str(self.rt.workspace.root)
 
     # ------------------------------------------------------------ project
     def project(self) -> tuple[list[str], list[tuple[TestAdapter, float]]]:
@@ -1519,7 +1541,13 @@ class TestImpactPlanner:
             cmds = plan.commands.get(tier) or []
             if not cmds:
                 continue
-            tier_result = {"tier": tier, "commands": [], "passed": 0, "failed": 0, "flaky": []}
+            tier_result: dict[str, Any] = {
+                "tier": tier,
+                "commands": [],
+                "passed": 0,
+                "failed": 0,
+                "flaky": [],
+            }
             for spec in cmds:
                 res = run_argv(spec.argv, cwd=spec.cwd, timeout=timeout)
                 parsed = parse_test_output(res.output, spec.framework)
@@ -1628,21 +1656,13 @@ class TestImpactPlanner:
         """
         ts = self.rt.task_state
         declared = bool(ts is not None and ts.state is not None and ts.state.declared_complete)
-        if not declared and self.rt.last_tool_family not in ("test", "build"):
+        verifying = self.rt.last_tool_family in ("test", "build")
+        if not declared and not verifying:
             return []
         plan = self.plan()
         if plan is None:
             return []
-        if self._verified(plan):
-            return []  # current changes already have passing evidence for tier 1
-        lines = [f"risk={plan.risk_score:.2f}"]
-        now = plan.commands.get(1) or []
-        if now:
-            lines.append("now: " + " && ".join(c.display() for c in now[:2])[:300])
-        elif plan.required_non_test_checks:
-            lines.append("now: " + display_argv(plan.required_non_test_checks[0].argv)[:200])
-        else:
-            lines.append("now: no directly impacted tests found")
+        tier1_ok, full_ok = self._coverage(plan)
         top = tiers_to_run(
             plan.risk_score,
             t2=self.config.test_risk_tier2,
@@ -1650,21 +1670,60 @@ class TestImpactPlanner:
             mandatory=bool(plan.mandatory_tier3),
             criteria_demand_tier2=self._criteria_demand_tier2(),
         )
+        if full_ok or (tier1_ok and top == 1):
+            return []  # current changes already have sufficient passing evidence
+        if not declared and not tier1_ok:
+            # Mid-iteration with failing or partial runs: the agent is already
+            # verifying; re-sending the plan on every run adds nothing.
+            return []
+        lines = [f"risk={plan.risk_score:.2f}"]
         nxt = plan.commands.get(2) or []
-        if top >= 2 and nxt:
-            lines.append("next-if-pass: " + " && ".join(c.display() for c in nxt[:2])[:300])
         full = plan.commands.get(3) or []
+        if tier1_ok:
+            lines.append("tier1: passed")
+            if top >= 2 and nxt:
+                lines.append("now: " + " && ".join(c.brief(self.root) for c in nxt[:2])[:300])
+            elif top >= 3 and full:
+                lines.append("now: " + full[0].brief(self.root)[:200])
+        else:
+            now = plan.commands.get(1) or []
+            if now:
+                lines.append("now: " + " && ".join(c.brief(self.root) for c in now[:2])[:300])
+            elif plan.required_non_test_checks:
+                lines.append("now: " + display_argv(plan.required_non_test_checks[0].argv)[:200])
+            else:
+                lines.append("now: no directly impacted tests found")
+            if top >= 2 and nxt:
+                lines.append(
+                    "next-if-pass: " + " && ".join(c.brief(self.root) for c in nxt[:2])[:300]
+                )
         if top >= 3 and full:
             why = ",".join(plan.mandatory_tier3) or "risk"
-            lines.append(
-                f"full-suite: required after tiers pass ({why}): " + full[0].display()[:160]
-            )
+            cmd = full[0].brief(self.root)[:160]
+            if any(line.endswith(": " + cmd) for line in lines):
+                cmd = "the command above"
+            lines.append(f"full-suite: required after tiers pass ({why}): {cmd}")
         else:
             lines.append("full-suite: not yet required")
         codes = [c for c in plan.rationale_codes if c][:4]
         if codes:
             lines.append("reason: " + ", ".join(codes).lower())
         return [(35, "verify", lines)]
+
+    def _coverage(self, plan: VerificationPlan) -> tuple[bool, bool]:
+        """(tier-1 selections passed, full suite passed) since the last change."""
+        snapshot = self._current_snapshot_hash()
+        rows = self.store.query(
+            "SELECT command_fingerprint, failed, errors FROM test_runs WHERE task_id = ? AND change_set_hash = ? ORDER BY ts DESC LIMIT 20",
+            (self.rt.task_id, snapshot),
+        )
+        if not rows or rows[0]["failed"] or rows[0]["errors"]:
+            return False, False
+        good = [r["command_fingerprint"] for r in rows if not r["failed"] and not r["errors"]]
+        full = any(not _SELECTOR_RE.search(" " + c) for c in good)
+        commands = " ".join(good)
+        tier1 = full or all(s.target and s.target in commands for s in plan.tier1)
+        return tier1, full
 
     def _verified(self, plan: VerificationPlan) -> bool:
         """True when a passing run since the last change covered every tier-1 selection."""

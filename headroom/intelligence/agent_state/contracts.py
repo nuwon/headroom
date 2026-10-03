@@ -310,7 +310,7 @@ class ToolContractValidator:
 
     @property
     def root(self) -> str:
-        return self.rt.workspace.root
+        return str(self.rt.workspace.root)
 
     @property
     def local(self) -> bool:

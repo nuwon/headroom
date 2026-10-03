@@ -1443,6 +1443,9 @@ def test_codex_session_launch_settings_keep_routing_process_local(
     assert args == (
         "--config",
         'openai_base_url="http://127.0.0.1:9898/v1"',
+        # The agent-state PreToolUse hook is enabled for this process only.
+        "--config",
+        "features.hooks=true",
         "exec",
         "hello",
     )
@@ -1453,6 +1456,7 @@ def test_codex_session_launch_settings_keep_routing_process_local(
         wrap_mod._CODEX_EMBEDDED_MODE_NOTE,
     ]
     assert config_file.read_text(encoding="utf-8") == original_config
+    assert "headroom-agent-state-hook" in (codex_home / "hooks.json").read_text(encoding="utf-8")
 
 
 def test_codex_session_launch_settings_preserve_custom_provider_identity(

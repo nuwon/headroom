@@ -1249,6 +1249,19 @@ def proxy(
         rollout_requests.append("read_maturation")
     rollout_snapshot = resolve_rollout(os.environ, requested=rollout_requests)
 
+    # Phase 2 agent-state layer: validated once here; a bad override value is a
+    # startup error, never silently ignored.
+    from headroom.intelligence.agent_state.config import (
+        AgentStateConfig,
+        AgentStateConfigError,
+    )
+
+    try:
+        agent_state_config = AgentStateConfig.from_env(os.environ, rollout=rollout_snapshot)
+    except AgentStateConfigError as exc:
+        click.secho(f"error: {exc}", fg="red", err=True)
+        sys.exit(1)
+
     if read_maturation and not rollout_snapshot.is_enabled("read_maturation"):
         click.secho(
             "error: --read-maturation is not available in the current rollout channel "
@@ -1385,6 +1398,7 @@ def proxy(
         port=port,
         rollout=rollout_snapshot,
         intelligence=intelligence_config,
+        agent_state=agent_state_config,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
         openai_extra_headers=resolved_openai_extra_headers,

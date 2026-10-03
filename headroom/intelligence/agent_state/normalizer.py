@@ -345,7 +345,7 @@ def _derived(
             add(EventType.FILE_READ, p, path_refs=(p,))
     if inv.family is Family.TEST:
         parsed = parse_test_output(item.text, inv.test_framework)
-        meta = {"framework": inv.test_framework}
+        meta: dict[str, Any] = {"framework": inv.test_framework}
         if parsed is not None:
             meta.update(passed=parsed.passed, failed=parsed.failed, errors=parsed.errors)
         add(EventType.TEST_RUN, "test", metadata=meta)

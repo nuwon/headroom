@@ -55,6 +55,16 @@ from .store import AgentStateStore, dumps, get_store, loads
 logger = logging.getLogger(__name__)
 
 MAX_RUNTIMES = 128
+MINOR_REFRESH_REQUESTS = 6
+# Delta blocks: at most this many deltas follow a full block, and a delta is
+# used only when it is at most this share of the full block's size.
+DELTA_CHAIN_MAX = 4
+DELTA_MAX_SHARE = 0.75
+# Every block stays in history and is re-sent on each later request. Minor
+# progress churn backs off as that history grows: the refresh interval grows by
+# MINOR_REFRESH_REQUESTS for every this many state tokens live in the history.
+# Major changes (goal, constraints, blockers, conflicts...) are never delayed.
+STATE_HISTORY_SOFT_TOKENS = 2000
 
 
 # ------------------------------------------------------------------ metrics
@@ -62,11 +72,11 @@ MAX_RUNTIMES = 128
 class AgentStateMetrics:
     """Counters only: never content (plan §15)."""
 
-    counters: Counter = field(default_factory=Counter)
+    counters: Counter[str] = field(default_factory=Counter)
     latency_ms: dict[str, list[float]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def bump(self, name: str, amount: float = 1) -> None:
+    def bump(self, name: str, amount: int = 1) -> None:
         with self._lock:
             self.counters[name] += amount
 
@@ -184,6 +194,7 @@ class AgentStateRuntime:
         self.history_tokens = 0
         self.pending_warnings: list[tuple[int, str, str]] = []  # (priority, key, text)
         self.last_tool_family = ""
+        self.requests_since_injection = 0
         self.tool_schemas: dict[str, Any] = {}
         self.created_now = False
         self._load_session()
@@ -355,6 +366,10 @@ class AgentStateRuntime:
         """Normalize ``items`` and dispatch the events not seen before, in order."""
         started = time.perf_counter()
         with self.lock:
+            if self.task_state is not None:
+                self.task_state.refresh()
+            if self.scope is not None:
+                self.scope.refresh()
             ids, start = self._ids_for(items)
             known = self.known_event_ids(ids[start:])
             ctx = NormalizeContext(
@@ -502,6 +517,12 @@ class AgentStateRuntime:
 
         return render_agent_state(self)
 
+    def render_state(self) -> Any:
+        """The composed state (:class:`~.serialization.ComposedState`) or None."""
+        from .serialization import render_state
+
+        return render_state(self)
+
 
 def _item_hash(item: HistoryItem) -> str:
     import hashlib
@@ -516,9 +537,10 @@ class RequestState:
     """Per-request handle between the provider handler and the service."""
 
     runtime: AgentStateRuntime
-    block: str | None
+    block: str | None  # the full block
     state_hash: str
     changed: bool = True  # material state differs from the last committed insertion
+    composed: Any = None  # serialization.ComposedState behind ``block``
     pending: PendingInjection | None = None
     labels: list[str] = field(default_factory=list)
 
@@ -544,6 +566,8 @@ class AgentStateService:
         self._lock = threading.RLock()
         self._blocked_calls: dict[str, tuple[str, float]] = {}
         self._caps: dict[tuple[str, str], Capabilities] = {}
+        # lineage key -> compact task-state terms for the Phase 1 TaskContext.
+        self._views: OrderedDict[str, tuple[str, ...]] = OrderedDict()
 
     def capabilities_for(self, workspace_id: str, agent_session: str, agent: str) -> Capabilities:
         with self._lock:
@@ -706,7 +730,7 @@ class AgentStateService:
             self._note_tools(rt, body.get("tools"))
             tokens = _approx_history_tokens(client_messages)
             rt.ingest_history(items, cwd=cwd, history_tokens=tokens)
-            return self._finish(rt)
+            return self._finish(rt, client_messages)
         except Exception:  # noqa: BLE001 - never break a request
             logger.debug("agent-state anthropic begin failed", exc_info=True)
             self.metrics.bump("errors")
@@ -759,7 +783,7 @@ class AgentStateService:
             )
             self._note_tools(rt, payload.get("tools"))
             rt.ingest_history(items, cwd=cwd, history_tokens=_approx_history_tokens(messages))
-            return self._finish(rt)
+            return self._finish(rt, raw_items)
         except Exception:  # noqa: BLE001
             logger.debug("agent-state responses begin failed", exc_info=True)
             self.metrics.bump("errors")
@@ -792,13 +816,113 @@ class AgentStateService:
         if has_headroom_tool and not rt.capabilities.can_execute_local_headroom_tool:
             rt.capabilities.can_execute_local_headroom_tool = True
 
-    def _finish(self, rt: AgentStateRuntime) -> RequestState | None:
-        rendered = rt.render()
-        if rendered is None:
+    def _remember_view(self, rt: AgentStateRuntime) -> None:
+        """Compact TaskState view for TaskContext (plan §11.2): scope paths and changed files."""
+        terms: list[str] = []
+        if rt.scope is not None and rt.scope.contract is not None:
+            terms.extend(rt.scope.contract.explicit_in_scope_paths[:8])
+        if rt.task_id:
+            rows = rt.store.query(
+                "SELECT path FROM task_changes WHERE task_id = ? AND path != '*' ORDER BY updated_at DESC LIMIT 8",
+                (rt.task_id,),
+            )
+            terms.extend(r["path"] for r in rows)
+        with self._lock:
+            self._views[rt.lineage] = tuple(dict.fromkeys(terms))[:12]
+            self._views.move_to_end(rt.lineage)
+            while len(self._views) > 256:
+                self._views.popitem(last=False)
+
+    def view_for(self, lineage: str) -> tuple[str, ...]:
+        with self._lock:
+            return self._views.get(lineage, ())
+
+    def live_state_tokens(self, rt: AgentStateRuntime, history: list[Any] | None) -> int:
+        """Tokens of this session's earlier blocks that are present in ``history``."""
+        if not history:
+            return 0
+        from .serialization import tokens
+
+        entries = self.injector.entries(rt.session_key)
+        return sum(
+            tokens(entries[p].text) for p in self.injector.live_positions(rt.session_key, history)
+        )
+
+    def _finish(
+        self, rt: AgentStateRuntime, history: list[Any] | None = None
+    ) -> RequestState | None:
+        try:
+            self._remember_view(rt)
+        except Exception:  # noqa: BLE001
+            logger.debug("task-state view update failed", exc_info=True)
+        composed = rt.render_state()
+        if composed is None:
             return RequestState(rt, None, self.injector.last_state_hash(rt.session_key))
-        block, state_hash = rendered
-        changed = state_hash != self.injector.last_state_hash(rt.session_key)
-        return RequestState(rt, block, state_hash, changed=changed)
+        block, state_hash = composed.block, composed.state_hash
+        last = self.injector.last_state_hash(rt.session_key)
+        rt.requests_since_injection += 1
+        if composed.has_events:
+            changed = True  # a fresh scope warning or macro announcement
+        elif state_hash == last:
+            changed = False
+        elif state_hash.split(":", 1)[0] != last.split(":", 1)[0]:
+            changed = True  # goal, constraints, blockers, warnings, decisions...
+        else:
+            # Progress churn only (an edit/test loop flips criteria back and
+            # forth): refresh with hysteresis, or at once on a completion claim.
+            ts = rt.task_state
+            declared = bool(ts is not None and ts.state is not None and ts.state.declared_complete)
+            backoff = 1 + self.live_state_tokens(rt, history) // STATE_HISTORY_SOFT_TOKENS
+            changed = declared or rt.requests_since_injection >= MINOR_REFRESH_REQUESTS * backoff
+        return RequestState(rt, block, state_hash, changed=changed, composed=composed)
+
+    def _encode(
+        self, rs: RequestState, history: list[Any], *, incremental: bool = False
+    ) -> tuple[str | None, bool]:
+        """``(text, full)``: the full block, or a delta when its base is provably present.
+
+        A delta is used only when the last full block and every delta after it
+        are present in this request's history (so nothing it builds on was
+        compacted away), the task is unchanged, the chain is short, and the
+        delta is clearly smaller. With ``previous_response_id`` the history is
+        server-side and cannot be checked, so the block is always full.
+        """
+        from .serialization import delta_block, parse_digests, tokens
+
+        composed = rs.composed
+        if rs.block is None or composed is None or not rs.changed or incremental:
+            return rs.block, True
+        if not composed.unique_headings:
+            return rs.block, True
+        key = rs.runtime.session_key
+        entries = self.injector.entries(key)
+        base = next((k for k in range(len(entries) - 1, -1, -1) if entries[k].full), None)
+        if base is None or len(entries) - 1 - base >= DELTA_CHAIN_MAX:
+            return rs.block, True
+        live = set(self.injector.live_positions(key, history))
+        if any(pos not in live for pos in range(base, len(entries))):
+            return rs.block, True
+        prev = entries[-1]
+        if not prev.digests or not prev.revision:
+            return rs.block, True
+        if parse_digests(prev.digests).get("@task", "") != dict(composed.attrs).get("task", ""):
+            return rs.block, True
+        delta = delta_block(composed, prev.digests, prev.revision)
+        if delta is None:
+            return None, False  # nothing the model can see changed
+        if tokens(delta) > DELTA_MAX_SHARE * tokens(rs.block):
+            return rs.block, True
+        return delta, False
+
+    def _memo_meta(self, rs: RequestState, full: bool) -> dict[str, Any]:
+        composed = rs.composed
+        if composed is None:
+            return {}
+        return {
+            "digests": composed.digests(),
+            "full": full,
+            "revision": dict(composed.attrs).get("revision", ""),
+        }
 
     def apply_anthropic(
         self,
@@ -807,13 +931,15 @@ class AgentStateService:
         outgoing: list[dict[str, Any]],
     ) -> list[dict[str, Any]] | None:
         try:
+            text, full = self._encode(rs, client_messages)
             result = self.injector.apply_anthropic(
                 rs.runtime.session_key,
                 client_messages,
                 outgoing,
-                rs.block,
+                text,
                 rs.state_hash,
                 only_if_orphaned=not rs.changed,
+                **self._memo_meta(rs, full),
             )
         except Exception:  # noqa: BLE001
             logger.debug("agent-state anthropic injection failed", exc_info=True)
@@ -822,7 +948,7 @@ class AgentStateService:
             return None
         messages, pending = result
         rs.pending = pending
-        rs.labels = _labels(pending, rs.block)
+        rs.labels = _labels(pending)
         return messages
 
     def apply_responses(
@@ -834,14 +960,16 @@ class AgentStateService:
         incremental: bool,
     ) -> list[Any] | None:
         try:
+            text, full = self._encode(rs, client_items, incremental=incremental)
             result = self.injector.apply_responses(
                 rs.runtime.session_key,
                 client_items,
                 outgoing,
-                rs.block,
+                text,
                 rs.state_hash,
                 incremental=incremental,
                 only_if_orphaned=not rs.changed,
+                **self._memo_meta(rs, full),
             )
         except Exception:  # noqa: BLE001
             logger.debug("agent-state responses injection failed", exc_info=True)
@@ -850,8 +978,19 @@ class AgentStateService:
             return None
         items, pending = result
         rs.pending = pending
-        rs.labels = _labels(pending, rs.block)
+        rs.labels = _labels(pending)
         return items
+
+    def discard(self, rs: RequestState | None) -> None:
+        """The mutated body did not reach the wire: forget a committed insertion."""
+        if rs is None or rs.pending is None or rs.pending.entry is None:
+            return
+        entry = rs.pending.entry
+        with self.injector._lock:  # noqa: SLF001 - same module family
+            entries = self.injector._memo.get(rs.runtime.session_key, [])  # noqa: SLF001
+            if entry in entries:
+                entries.remove(entry)
+        rs.runtime.save_session()
 
     def commit(self, rs: RequestState | None) -> None:
         """The mutated body went on the wire: remember the insertion."""
@@ -860,8 +999,12 @@ class AgentStateService:
         try:
             self.injector.commit(rs.pending)
             if rs.pending.entry is not None:
+                rs.runtime.requests_since_injection = 0
                 tokens = max(1, len(rs.pending.entry.text) // 4)
                 self.metrics.bump("injections")
+                self.metrics.bump(
+                    "injections_full" if rs.pending.entry.full else "injections_delta"
+                )
                 self.metrics.bump("injected_tokens", tokens)
                 rt = rs.runtime
                 if rt.task_state is not None:
@@ -959,10 +1102,27 @@ class AgentStateService:
                 pass
 
 
-def _labels(pending: PendingInjection, block: str | None) -> list[str]:
+def anthropic_cwd(body: dict[str, Any], headers: Any) -> str:
+    """Project cwd for a Claude Code request: ``x-headroom-cwd`` or the system prompt."""
+    try:
+        header = headers.get("x-headroom-cwd") if headers is not None else None
+    except Exception:  # noqa: BLE001
+        header = None
+    if header:
+        return str(header).strip()
+    from headroom.memory.storage_router import ProjectResolver, extract_system_prompt
+
+    try:
+        return ProjectResolver._extract_cwd_from_system_prompt(extract_system_prompt(body)) or ""  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _labels(pending: PendingInjection) -> list[str]:
     labels = []
-    if pending.entry is not None and block:
-        labels.append(f"agent_state:inject:{max(1, len(block) // 4)}tok")
+    if pending.entry is not None:
+        kind = "inject" if pending.entry.full else "inject_delta"
+        labels.append(f"agent_state:{kind}:{max(1, len(pending.entry.text) // 4)}tok")
     if pending.replayed:
         labels.append(f"agent_state:replay:{pending.replayed}")
     return labels
@@ -984,3 +1144,33 @@ def _approx_history_tokens(messages: list[dict[str, Any]]) -> int:
                         elif value is not None:
                             total += len(str(value))
     return total // 4
+
+
+# --------------------------------------------------------------- install
+_SERVICE: AgentStateService | None = None
+
+
+def install_service(service: AgentStateService | None) -> None:
+    """Make ``service`` visible to the Phase 1 TaskContext builder (one per proxy)."""
+    global _SERVICE
+    _SERVICE = service
+
+
+def current_service() -> AgentStateService | None:
+    return _SERVICE
+
+
+def task_state_terms(messages: list[dict[str, Any]]) -> tuple[str, ...]:
+    """Exact terms from the conversation's TaskState view (empty when unavailable)."""
+    service = _SERVICE
+    if service is None or not messages:
+        return ()
+    from .normalizer import _flatten, clean_user_text
+
+    for msg in messages[:12]:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = clean_user_text(_flatten(msg.get("content")))
+        if text:
+            return service.view_for(lineage_key(text))
+    return ()

@@ -313,3 +313,15 @@ def test_no_jevk5_needed_for_execution(service, repo: Path) -> None:
     assert service.advisor() is None
     rs = send(service, Conversation(repo, "Fix src/pkg/core.py."))
     assert WorkflowExecutor(rs.runtime).run("show_task_owned_diff")["status"] == "success"
+
+
+def test_slot_validator_handles_windows_shaped_values(tmp_path: Path) -> None:
+    from headroom.intelligence.agent_state.workflows import _valid_project_path
+
+    root = str(tmp_path)
+    assert _valid_project_path("src\\pkg\\core.py", root, must_exist=False)
+    assert not _valid_project_path("..\\outside.py", root, must_exist=False)  # traversal
+    assert not _valid_project_path("src\\..\\..\\x.py", root, must_exist=False)
+    assert not _valid_project_path("C:\\Windows\\system32\\x.dll", root, must_exist=False)
+    assert not _valid_project_path(".git\\config", root, must_exist=False)  # protected
+    assert not _valid_project_path("-rf", root, must_exist=False)  # flag

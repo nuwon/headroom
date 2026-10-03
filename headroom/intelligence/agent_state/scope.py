@@ -216,7 +216,7 @@ class ScopeFirewall:
     # ---------------------------------------------------------- lifecycle
     @property
     def root(self) -> str:
-        return self.rt.workspace.root
+        return str(self.rt.workspace.root)
 
     def _task(self) -> Any:
         ts = self.rt.task_state
@@ -234,6 +234,13 @@ class ScopeFirewall:
                 self.contract = ChangeContract.from_json(loads(row["contract_json"], {}))
             except (TypeError, ValueError, KeyError):
                 self.contract = None
+
+    def refresh(self) -> None:
+        task_id = self.rt.task_id
+        if task_id and (self.contract is None or self.contract.task_id != task_id):
+            self._load()
+            if self.contract is None:
+                self.on_task_update()
 
     def on_new_task(self) -> None:
         self.contract = None
