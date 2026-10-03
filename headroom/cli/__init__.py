@@ -20,6 +20,7 @@ from . import (  # noqa: F401
     init,
     inspect,
     install,
+    intelligence,
     learn,
     mcp,
     perf,

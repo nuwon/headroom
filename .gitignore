@@ -272,3 +272,4 @@ uv.lock
 .tokensave
 
 .codebase-memory/
+.headroom-dev/
