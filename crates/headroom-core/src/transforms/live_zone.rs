@@ -118,6 +118,8 @@ use super::log_compressor::{LogCompressor, LogCompressorConfig};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
 use crate::ccr::{compute_key, marker_for, CcrStore};
+use crate::compression_policy::CompressionPolicy;
+use crate::intelligence::{explicit_entities, relevance_query, IntelligenceSettings, InvariantSet};
 use crate::tokenizer::get_tokenizer;
 
 // ─── Tunable constants (no magic numbers in the dispatch logic) ────────
@@ -139,10 +141,90 @@ const STRATEGY_CODE_COMPRESSOR: &str = "code_compressor";
 #[cfg(feature = "ml")]
 const STRATEGY_KOMPRESS: &str = "kompress";
 
-/// Empty query context passed to compressors that take a relevance
-/// query string. PR-B3 dispatcher does not yet plumb the user's last
-/// prompt through; PR-F3 will.
-const EMPTY_QUERY: &str = "";
+/// Per-request intelligence context for block dispatch.
+///
+/// Built once per request from the parsed body. Every switch is off unless
+/// `HEADROOM_INTELLIGENCE` / the per-feature variables enable it (see
+/// [`IntelligenceSettings`]), in which case the dispatcher:
+///
+/// * passes the latest user prose as the relevance query to the
+///   query-aware compressors (instead of an empty string);
+/// * vetoes a rewrite that drops an invariant (user entity, exit code,
+///   error line, test summary) it cannot recover;
+/// * applies policy admission: irreversible drop <= `max_lossy_ratio`.
+struct BlockIntel {
+    settings: IntelligenceSettings,
+    query: String,
+    entities: Vec<String>,
+    policy: CompressionPolicy,
+}
+
+impl BlockIntel {
+    fn for_request(messages: &[Value], auth_mode: AuthMode) -> Self {
+        Self::with_settings(IntelligenceSettings::from_env(), messages, auth_mode)
+    }
+
+    fn with_settings(
+        settings: IntelligenceSettings,
+        messages: &[Value],
+        auth_mode: AuthMode,
+    ) -> Self {
+        let (query, entities) = if settings.any() {
+            let query = relevance_query(messages);
+            let entities = explicit_entities(&query);
+            (query, entities)
+        } else {
+            (String::new(), Vec::new())
+        };
+        Self {
+            settings,
+            query,
+            entities,
+            policy: CompressionPolicy::for_mode(auth_mode.into()),
+        }
+    }
+
+    /// Relevance query for the compressors ("" unless task query is on).
+    fn query(&self) -> &str {
+        if self.settings.task_query {
+            &self.query
+        } else {
+            ""
+        }
+    }
+
+    /// First reason to reject `candidate` for `original`, or `None`.
+    fn rejection(
+        &self,
+        original: &str,
+        candidate: &str,
+        original_tokens: usize,
+        candidate_tokens: usize,
+        recoverable: bool,
+    ) -> Option<&'static str> {
+        if self.settings.invariant_guard {
+            let invariants = InvariantSet::extract(original, &self.entities);
+            if let Some(violation) = invariants.violation(candidate, recoverable) {
+                return Some(violation);
+            }
+        }
+        if self.settings.policy_budget {
+            // Every live-zone compressor is lossy; a CCR marker whose
+            // original is persisted on acceptance makes it recoverable.
+            let admission = self.policy.admit_lossy(
+                original_tokens,
+                candidate_tokens,
+                recoverable,
+                false,
+                true,
+            );
+            if !admission.allowed {
+                return Some(admission.reason.as_str());
+            }
+        }
+        None
+    }
+}
 /// Default relevance bias passed to scoring-aware compressors. Mirrors
 /// the OSS-default behaviour ("no bias").
 const DEFAULT_BIAS: f64 = 0.0;
@@ -273,6 +355,19 @@ impl From<crate::auth_mode::AuthMode> for AuthMode {
     }
 }
 
+impl From<AuthMode> for crate::auth_mode::AuthMode {
+    fn from(mode: AuthMode) -> Self {
+        match mode {
+            AuthMode::Payg => crate::auth_mode::AuthMode::Payg,
+            AuthMode::OAuth => crate::auth_mode::AuthMode::OAuth,
+            AuthMode::Subscription => crate::auth_mode::AuthMode::Subscription,
+            // Unclassified callers get the PAYG budget, as the dispatcher
+            // has always treated them.
+            AuthMode::Unknown => crate::auth_mode::AuthMode::Payg,
+        }
+    }
+}
+
 /// Per-block decision recorded for observability. Independent of
 /// whether the body was actually rewritten.
 #[derive(Debug, Clone)]
@@ -352,6 +447,20 @@ pub enum BlockAction {
         /// Would-be compressed-block-content size, tokens. Always
         /// `>= original_tokens` (otherwise this would be
         /// `Compressed`).
+        compressed_tokens: usize,
+    },
+    /// A compressor produced a smaller output, but the intelligence
+    /// layer rejected it (invariant guard veto or policy admission —
+    /// `reason` names which, e.g. `"error_signal_dropped"` or
+    /// `"max_lossy_ratio"`). The original bytes are forwarded.
+    RejectedByIntelligence {
+        /// Identifier of the compressor whose output was rejected.
+        strategy: &'static str,
+        /// Stable reason tag (Python guard / admission vocabulary).
+        reason: &'static str,
+        /// Original block-content size, tokens.
+        original_tokens: usize,
+        /// Would-be compressed-block-content size, tokens.
         compressed_tokens: usize,
     },
     /// The block content was below the per-content-type byte
@@ -475,12 +584,14 @@ pub fn summarize_openai_responses_no_change_reason(manifest: &CompressionManifes
     let mut saw_below_output_floor = false;
     let mut saw_below_plain_text_floor = false;
     let mut saw_rejected_not_smaller = false;
+    let mut saw_rejected_by_intelligence = false;
     let mut saw_compressor_error = false;
 
     for outcome in &manifest.block_outcomes {
         match &outcome.action {
             BlockAction::CompressorError { .. } => saw_compressor_error = true,
             BlockAction::RejectedNotSmaller { .. } => saw_rejected_not_smaller = true,
+            BlockAction::RejectedByIntelligence { .. } => saw_rejected_by_intelligence = true,
             BlockAction::BelowByteThreshold { content_type, .. } => {
                 if *content_type == "output_item" {
                     saw_below_output_floor = true;
@@ -498,6 +609,8 @@ pub fn summarize_openai_responses_no_change_reason(manifest: &CompressionManifes
         "compressor_error"
     } else if saw_rejected_not_smaller {
         "rejected_not_smaller"
+    } else if saw_rejected_by_intelligence {
+        "rejected_by_intelligence"
     } else if saw_below_output_floor {
         "below_output_floor"
     } else if saw_below_plain_text_floor {
@@ -941,7 +1054,7 @@ pub fn compress_anthropic_live_zone(
 pub fn compress_anthropic_live_zone_with_ccr(
     body_raw: &[u8],
     frozen_message_count: usize,
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
     ccr_store: Option<&dyn CcrStore>,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
@@ -1008,6 +1121,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
     // produced compressed output; the byte-threshold gate filters
     // sub-threshold content first.
     let tokenizer = get_tokenizer(model);
+    let intel = BlockIntel::for_request(messages, auth_mode);
 
     for slot in plan {
         let outcome = match slot.kind {
@@ -1035,6 +1149,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     tokenizer.as_ref(),
                     &mut replacements,
                     ccr_store,
+                    &intel,
                 );
                 outcome
             }
@@ -1053,6 +1168,7 @@ pub fn compress_anthropic_live_zone_with_ccr(
                     tokenizer.as_ref(),
                     &mut replacements,
                     ccr_store,
+                    &intel,
                 )
             }
         };
@@ -1127,6 +1243,7 @@ fn compress_one_block(
     tokenizer: &dyn crate::tokenizer::Tokenizer,
     replacements: &mut Vec<Replacement>,
     ccr_store: Option<&dyn CcrStore>,
+    intel: &BlockIntel,
 ) -> BlockOutcome {
     // 1. Byte-threshold gate. Empty content always falls through to
     //    `dispatch_compressor` (which short-circuits on empty), so
@@ -1145,7 +1262,7 @@ fn compress_one_block(
         };
     }
 
-    match dispatch_compressor(content_text, content_type) {
+    match dispatch_compressor(content_text, content_type, intel.query()) {
         DispatchResult::NoOp { content_type } => BlockOutcome {
             message_index,
             block_index,
@@ -1193,6 +1310,24 @@ fn compress_one_block(
                         strategy,
                         original_bytes,
                         compressed_bytes,
+                        original_tokens,
+                        compressed_tokens,
+                    },
+                }
+            } else if let Some(reason) = intel.rejection(
+                content_text,
+                &compressed_for_replacement,
+                original_tokens,
+                compressed_tokens,
+                ccr_hash_emitted.is_some(),
+            ) {
+                BlockOutcome {
+                    message_index,
+                    block_index,
+                    block_type,
+                    action: BlockAction::RejectedByIntelligence {
+                        strategy,
+                        reason,
                         original_tokens,
                         compressed_tokens,
                     },
@@ -1630,7 +1765,7 @@ enum DispatchResult {
 /// Any arm whose content type is named in
 /// `HEADROOM_LIVE_ZONE_DISABLE_ARMS` short-circuits to a no-op before
 /// the table below is consulted.
-fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult {
+fn dispatch_compressor(text: &str, content_type: ContentType, query: &str) -> DispatchResult {
     if text.is_empty() {
         return DispatchResult::NoOp {
             content_type: content_type.as_str(),
@@ -1653,7 +1788,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             // too (confidence 0.8). SmartCrusher's `crush` is safe to
             // call on those — it parses, finds no compressible
             // arrays, and returns the input.
-            let result = smart_crusher().crush(text, EMPTY_QUERY, DEFAULT_BIAS);
+            let result = smart_crusher().crush(text, query, DEFAULT_BIAS);
             if !result.was_modified {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
@@ -1677,7 +1812,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             }
         }
         ContentType::SearchResults => {
-            let (result, _stats) = search_compressor().compress(text, EMPTY_QUERY, DEFAULT_BIAS);
+            let (result, _stats) = search_compressor().compress(text, query, DEFAULT_BIAS);
             if result.compressed == result.original {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
@@ -1689,7 +1824,7 @@ fn dispatch_compressor(text: &str, content_type: ContentType) -> DispatchResult 
             }
         }
         ContentType::GitDiff => {
-            let result = diff_compressor().compress(text, EMPTY_QUERY);
+            let result = diff_compressor().compress(text, query);
             if result.compressed == text {
                 return DispatchResult::NoOp {
                     content_type: content_type.as_str(),
@@ -1803,6 +1938,71 @@ mod tests {
             LiveZoneOutcome::Modified { manifest, .. } => manifest,
         };
         manifest.block_outcomes.iter().map(|b| &b.action).collect()
+    }
+
+    fn intel(task_query: bool, invariant_guard: bool, policy_budget: bool) -> BlockIntel {
+        let messages = vec![
+            json!({"role": "user", "content": "why does `test_parse` fail in src/http.rs?"}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]}),
+        ];
+        BlockIntel::with_settings(
+            IntelligenceSettings {
+                task_query,
+                invariant_guard,
+                policy_budget,
+            },
+            &messages,
+            AuthMode::Payg,
+        )
+    }
+
+    #[test]
+    fn intel_off_keeps_empty_query_and_never_rejects() {
+        let off = intel(false, false, false);
+        assert_eq!(off.query(), "");
+        assert_eq!(
+            off.rejection("a\nError: boom\n", "a", 1000, 10, false),
+            None
+        );
+    }
+
+    #[test]
+    fn intel_query_is_latest_user_prose() {
+        let on = intel(true, false, false);
+        assert_eq!(on.query(), "why does `test_parse` fail in src/http.rs?");
+        assert!(on.entities.iter().any(|e| e == "test_parse"));
+        // Entities feed the guard even when only the guard is on.
+        let guard_only = intel(false, true, false);
+        assert_eq!(guard_only.query(), "");
+        assert!(!guard_only.entities.is_empty());
+    }
+
+    #[test]
+    fn intel_guard_vetoes_dropped_error_unless_recoverable() {
+        let guard = intel(false, true, false);
+        let original = "line 1\nError: connection refused\nline 3\n";
+        assert_eq!(
+            guard.rejection(original, "line 1\nline 3", 100, 50, false),
+            Some("error_signal_dropped")
+        );
+        assert_eq!(
+            guard.rejection(original, "line 1\n<<ccr:abcdef12>>", 100, 50, true),
+            None
+        );
+    }
+
+    #[test]
+    fn intel_policy_caps_irreversible_drop_at_max_lossy_ratio() {
+        let policy = intel(false, false, true);
+        // PAYG cap 0.45: a 90% unrecoverable drop is rejected…
+        assert_eq!(
+            policy.rejection("o", "c", 1000, 100, false),
+            Some("max_lossy_ratio")
+        );
+        // …a 40% one is admitted, and a recoverable 90% one too.
+        assert_eq!(policy.rejection("o", "c", 1000, 600, false), None);
+        assert_eq!(policy.rejection("o", "c", 1000, 100, true), None);
     }
 
     #[test]
@@ -2208,7 +2408,7 @@ mod tests {
 /// equality on the prefix and suffix.
 pub fn compress_openai_chat_live_zone(
     body_raw: &[u8],
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
@@ -2273,6 +2473,7 @@ pub fn compress_openai_chat_live_zone(
     }
 
     let tokenizer = get_tokenizer(model);
+    let intel = BlockIntel::for_request(messages, auth_mode);
     let mut block_outcomes: Vec<BlockOutcome> = Vec::with_capacity(all_slots.len());
     let mut replacements: Vec<Replacement> = Vec::new();
 
@@ -2288,6 +2489,7 @@ pub fn compress_openai_chat_live_zone(
             tokenizer.as_ref(),
             &mut replacements,
             None, // PR-C2: no CCR store yet on the OpenAI path.
+            &intel,
         );
         block_outcomes.push(outcome);
     }
@@ -2665,7 +2867,7 @@ const RESPONSES_OUTPUT_MIN_BYTES: usize = 512;
 /// input, never re-serialized.
 pub fn compress_openai_responses_live_zone(
     body_raw: &[u8],
-    _auth_mode: AuthMode,
+    auth_mode: AuthMode,
     model: &str,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
@@ -2767,6 +2969,7 @@ pub fn compress_openai_responses_live_zone(
     }
 
     let tokenizer = get_tokenizer(model);
+    let intel = BlockIntel::for_request(items, auth_mode);
     let mut block_outcomes: Vec<BlockOutcome> = Vec::with_capacity(all_slots.len());
     let mut replacements: Vec<Replacement> = Vec::new();
 
@@ -2798,6 +3001,7 @@ pub fn compress_openai_responses_live_zone(
             tokenizer.as_ref(),
             &mut replacements,
             None, // PR-C3: no CCR store on the Responses path yet.
+            &intel,
         );
         block_outcomes.push(outcome);
     }

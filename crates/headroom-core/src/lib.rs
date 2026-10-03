@@ -8,6 +8,7 @@ pub mod auth_mode;
 pub mod cache_control;
 pub mod ccr;
 pub mod compression_policy;
+pub mod intelligence;
 #[cfg(feature = "ml")]
 mod onnx_cpu;
 pub mod relevance;

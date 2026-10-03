@@ -27,17 +27,38 @@
 //! representation. Cosine similarity agrees to ~1e-6.
 
 #[cfg(feature = "ml")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "ml")]
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use super::base::{RelevanceScore, RelevanceScorer};
+#[cfg(feature = "ml")]
+use super::embedding_cache::{EmbeddingCache, DEFAULT_EMBEDDING_CACHE_CAPACITY};
+
+/// Opt-in switch for the process-wide embedding scorer
+/// ([`EmbeddingScorer::shared`]). Off by default: loading the model costs
+/// ~1-2 s and (first run) a ~30 MB download, so semantic relevance in the
+/// Rust compressors is something an operator turns on deliberately.
+pub const EMBEDDINGS_ENV: &str = "HEADROOM_RUST_EMBEDDINGS";
+
+/// Whether [`EMBEDDINGS_ENV`] asks for embeddings (`1/true/yes/on`).
+pub fn embeddings_requested() -> bool {
+    std::env::var(EMBEDDINGS_ENV)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enabled"
+            )
+        })
+        .unwrap_or(false)
+}
 
 /// fastembed-backed semantic relevance scorer.
 ///
 /// Construct via `EmbeddingScorer::try_new()` to handle the model-load
-/// fallible step explicitly. `EmbeddingScorer::default()` is provided
+/// fallible step explicitly, or [`EmbeddingScorer::shared`] for the
+/// process-wide instance. `EmbeddingScorer::default()` is provided
 /// for backwards compatibility but `is_available()` returns `false`
 /// when the inner model failed to load (mimicking Python's
 /// "sentence-transformers not installed" branch).
@@ -49,35 +70,39 @@ pub struct EmbeddingScorer {
     /// `HybridScorer::default()` work even when the model can't be
     /// loaded (e.g. offline, no model cache).
     ///
-    /// Wrapped in a `Mutex` because `TextEmbedding::embed` requires
-    /// `&mut self` (the underlying ONNX session is single-threaded).
-    /// Concurrent callers serialize on the inner lock, which is fine
-    /// for the SmartCrusher hot path — embedding inference is the
-    /// dominant cost so contention is bounded by inference latency,
-    /// not lock latency.
-    model: Option<Mutex<TextEmbedding>>,
+    /// The session sits behind a `Mutex` because `TextEmbedding::embed`
+    /// requires `&mut self` (the underlying ONNX session is
+    /// single-threaded), and behind an `Arc` so every scorer built from
+    /// [`EmbeddingScorer::shared`] reuses one loaded model.
+    model: Option<Arc<Mutex<TextEmbedding>>>,
+    /// LRU embedding cache shared with the model (repeated rows, chunks
+    /// and queries are embedded once).
+    cache: Option<Arc<EmbeddingCache>>,
 }
 
 #[cfg(feature = "ml")]
 impl Default for EmbeddingScorer {
     /// Returns an unloaded scorer (model = None, is_available = false).
     ///
-    /// Mirrors Python's "sentence-transformers not installed" branch:
-    /// `HybridScorer::default()` constructs an EmbeddingScorer via
-    /// `default()`, finds it unavailable, and uses BM25-fallback.
-    ///
-    /// To get a real, model-backed scorer call `try_new()` explicitly
-    /// and pass it via `HybridScorer::with_scorers`. This separation
-    /// keeps `Default` cheap (no I/O) and predictable in tests —
+    /// Mirrors Python's "sentence-transformers not installed" branch.
+    /// Keeping `Default` cheap (no I/O) keeps it predictable in tests —
     /// otherwise model availability would depend on whether the user
-    /// has previously cached the weights.
+    /// has previously cached the weights. [`EmbeddingScorer::shared`] is
+    /// the opt-in, model-backed path.
     fn default() -> Self {
         EmbeddingScorer {
             model_name: "BAAI/bge-small-en-v1.5".to_string(),
             model: None,
+            cache: None,
         }
     }
 }
+
+#[cfg(feature = "ml")]
+type SharedSlot = Option<(String, Arc<Mutex<TextEmbedding>>, Arc<EmbeddingCache>)>;
+
+#[cfg(feature = "ml")]
+static SHARED: OnceLock<SharedSlot> = OnceLock::new();
 
 #[cfg(feature = "ml")]
 impl EmbeddingScorer {
@@ -118,8 +143,76 @@ impl EmbeddingScorer {
             .map_err(|e| format!("EmbeddingScorer model load failed: {}", e))?;
         Ok(EmbeddingScorer {
             model_name: name,
-            model: Some(Mutex::new(model)),
+            model: Some(Arc::new(Mutex::new(model))),
+            cache: Some(Arc::new(EmbeddingCache::new(
+                DEFAULT_EMBEDDING_CACHE_CAPACITY,
+            ))),
         })
+    }
+
+    /// Process-wide scorer (lazy, loaded at most once per process).
+    ///
+    /// When [`EMBEDDINGS_ENV`] is set, the first call loads the default
+    /// model; every scorer returned afterwards shares that session and its
+    /// LRU cache. When the variable is unset or the load fails (logged
+    /// once), this is the unloaded [`Default`] scorer and callers keep
+    /// their BM25 path — exactly the pre-existing behaviour.
+    pub fn shared() -> Self {
+        let slot = SHARED.get_or_init(|| {
+            if !embeddings_requested() {
+                return None;
+            }
+            match Self::try_new() {
+                Ok(scorer) => Some((scorer.model_name, scorer.model?, scorer.cache?)),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "embedding_scorer_unavailable",
+                        error = %error,
+                        "semantic relevance requested but unavailable; using BM25"
+                    );
+                    None
+                }
+            }
+        });
+        match slot {
+            Some((name, model, cache)) => EmbeddingScorer {
+                model_name: name.clone(),
+                model: Some(Arc::clone(model)),
+                cache: Some(Arc::clone(cache)),
+            },
+            None => Self::default(),
+        }
+    }
+
+    /// `(hits, misses, len)` of the embedding cache, when there is one.
+    pub fn cache_stats(&self) -> Option<(u64, u64, usize)> {
+        self.cache.as_ref().map(|c| c.stats())
+    }
+
+    /// Embeddings for `texts` in order (cache first, one model call for
+    /// the misses). Errors carry the reason without the "Embedding: "
+    /// prefix.
+    fn embed_all(&self, texts: &[&str]) -> Result<Vec<Arc<Vec<f32>>>, String> {
+        let Some(model) = &self.model else {
+            return Err("model not available".to_string());
+        };
+        let run = |owned: Vec<String>| -> Result<Vec<Vec<f32>>, String> {
+            let mut guard = model.lock().map_err(|_| "lock poisoned".to_string())?;
+            guard
+                .embed(owned, None)
+                .map_err(|e| format!("inference failed: {}", e))
+        };
+        let out = match &self.cache {
+            Some(cache) => cache.get_or_embed(texts, run)?,
+            None => run(texts.iter().map(|s| s.to_string()).collect())?
+                .into_iter()
+                .map(Arc::new)
+                .collect(),
+        };
+        if out.len() != texts.len() || out.iter().any(|e| e.is_empty()) {
+            return Err("unexpected embedding count".to_string());
+        }
+        Ok(out)
     }
 }
 
@@ -129,20 +222,13 @@ impl RelevanceScorer for EmbeddingScorer {
         if item.is_empty() || context.is_empty() {
             return RelevanceScore::empty("Embedding: empty input");
         }
-        let Some(model) = &self.model else {
+        if self.model.is_none() {
             return RelevanceScore::empty("Embedding: model not available");
-        };
-        let mut guard = match model.lock() {
-            Ok(g) => g,
-            Err(_) => return RelevanceScore::empty("Embedding: lock poisoned"),
-        };
-        let embeddings = match guard.embed(vec![item.to_string(), context.to_string()], None) {
-            Ok(e) => e,
-            Err(e) => return RelevanceScore::empty(format!("Embedding: inference failed: {}", e)),
-        };
-        if embeddings.len() != 2 {
-            return RelevanceScore::empty("Embedding: unexpected embedding count");
         }
+        let embeddings = match self.embed_all(&[item, context]) {
+            Ok(e) => e,
+            Err(e) => return RelevanceScore::empty(format!("Embedding: {}", e)),
+        };
         let sim = cosine_similarity(&embeddings[0], &embeddings[1]);
         RelevanceScore::new(
             sim,
@@ -161,43 +247,27 @@ impl RelevanceScorer for EmbeddingScorer {
                 .map(|_| RelevanceScore::empty("Embedding: empty context"))
                 .collect();
         }
-        let Some(model) = &self.model else {
+        if self.model.is_none() {
             return items
                 .iter()
                 .map(|_| RelevanceScore::empty("Embedding: model not available"))
                 .collect();
-        };
-        let mut guard = match model.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                return items
-                    .iter()
-                    .map(|_| RelevanceScore::empty("Embedding: lock poisoned"))
-                    .collect();
-            }
-        };
-
+        }
         // Encode items + context in one batch — saves model dispatch
-        // overhead. Mirrors Python fastembed batch encoding.
-        let mut all_texts: Vec<String> = items.iter().map(|s| s.to_string()).collect();
-        all_texts.push(context.to_string());
-        let embeddings = match guard.embed(all_texts, None) {
+        // overhead. Mirrors Python fastembed batch encoding; cached
+        // texts are not re-encoded.
+        let mut all_texts: Vec<&str> = items.to_vec();
+        all_texts.push(context);
+        let embeddings = match self.embed_all(&all_texts) {
             Ok(e) => e,
             Err(e) => {
                 return items
                     .iter()
-                    .map(|_| RelevanceScore::empty(format!("Embedding: inference failed: {}", e)))
+                    .map(|_| RelevanceScore::empty(format!("Embedding: {}", e)))
                     .collect();
             }
         };
-        if embeddings.len() != items.len() + 1 {
-            return items
-                .iter()
-                .map(|_| RelevanceScore::empty("Embedding: unexpected embedding count"))
-                .collect();
-        }
-
-        let context_emb = embeddings.last().unwrap().clone();
+        let context_emb = Arc::clone(embeddings.last().expect("context embedding"));
         embeddings
             .iter()
             .take(items.len())
@@ -233,6 +303,19 @@ impl Default for EmbeddingScorer {
         EmbeddingScorer {
             model_name: "BAAI/bge-small-en-v1.5".to_string(),
         }
+    }
+}
+
+#[cfg(not(feature = "ml"))]
+impl EmbeddingScorer {
+    /// Lexical-only build: there is no model to share.
+    pub fn shared() -> Self {
+        Self::default()
+    }
+
+    /// No cache without a model.
+    pub fn cache_stats(&self) -> Option<(u64, u64, usize)> {
+        None
     }
 }
 
@@ -315,6 +398,7 @@ mod tests {
         EmbeddingScorer {
             model_name: "test".to_string(),
             model: None,
+            cache: None,
         }
     }
 

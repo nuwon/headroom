@@ -1,0 +1,194 @@
+---
+title: Context Intelligence
+description: Task-aware, quality-guarded compression for Claude Code and Codex, plus the optional local JevK5 decision model via llama.cpp.
+---
+
+Context intelligence makes Headroom compress **for the task at hand** instead of
+compressing every tool output the same way. It reads the user's request,
+keeps what the task needs verbatim, proves that nothing the model depends on
+was lost, and externalizes the rest behind exact, searchable retrieval.
+
+It is enabled through the normal configuration routes — environment variables,
+`headroom proxy` / `headroom wrap` flags and the savings profile. There is no
+rollout channel to join.
+
+<Callout type="info" title="On by default for coding agents">
+  The `coding` savings profile — what `headroom proxy` and `headroom wrap claude`/`codex`
+  use out of the box — seeds `HEADROOM_INTELLIGENCE=safe`. An explicit value always wins,
+  so `HEADROOM_INTELLIGENCE=off` restores the previous behaviour exactly.
+</Callout>
+
+## Postures
+
+| Posture | What it turns on |
+|---|---|
+| `off` | Nothing. Request bytes are identical to a proxy without the layer. |
+| `safe` | Task-aware relevance, invariant guard, policy risk budget, Transform Arbiter, indexed CCR search, selective expansion, complexity-aware verbosity, code-graph relevance, retention learning, speculative prep. |
+| `full` | `safe` plus delta encoding of repeated outputs, pre-context admission of huge outputs, the global budget allocator, the progressive tool catalog and rich tool-result interceptors. |
+
+Aliases: `on`/`1`/`true` mean `safe`; `max`/`all` mean `full`.
+
+### Enable it
+
+PowerShell (Windows):
+
+```powershell
+$env:HEADROOM_INTELLIGENCE = "full"
+headroom wrap claude          # or: headroom wrap codex
+# one-off, without touching the environment:
+headroom wrap codex --intelligence full
+```
+
+cmd (Windows):
+
+```bat
+set HEADROOM_INTELLIGENCE=full
+headroom wrap claude
+```
+
+bash / zsh:
+
+```bash
+export HEADROOM_INTELLIGENCE=full
+headroom wrap claude
+headroom proxy --intelligence safe --port 8787
+```
+
+`headroom wrap` restarts an already-running proxy whose posture differs from
+the one requested, so switching postures needs no manual restart.
+
+## What each feature does
+
+| Env var | Posture | Feature |
+|---|---|---|
+| `HEADROOM_TASK_QUERY` | safe | Builds a task context from the latest user turn (paths, symbols, quoted terms, error codes) and uses it as the relevance query instead of the raw last message. |
+| `HEADROOM_INVARIANT_GUARD` | safe | Vetoes a rewrite that drops a user-named entity, an exit code, an error line or a test summary it cannot recover, changes a number, or presents a partial output as complete. |
+| `HEADROOM_POLICY_RISK_BUDGET` | safe | Enforces `max_lossy_ratio` on the **irreversible** part of a drop (0.45 PAYG, 0.25 subscription). Exact CCR externalization is not irreversible. |
+| `HEADROOM_ARBITER` | safe | Lets the router's result, a byte-lossless fold, a task-aware indexed preview and a conservative re-compression compete; the original wins when no candidate is safe. |
+| `HEADROOM_CCR_SEARCH` | safe | Adds optional `query` / `mode` / `top_k` / `cursor` / `range` arguments to `headroom_retrieve`, so the model fetches only the relevant spans of a stored original. |
+| `HEADROOM_CCR_SELECTIVE_EXPANSION` | safe | Proactive expansion returns task-relevant spans instead of whole originals. |
+| `HEADROOM_COMPLEXITY_ROUTING` | safe | Never steers a turn that asked "why"/"explain" to conclusions-only verbosity (with `HEADROOM_OUTPUT_SHAPER`). |
+| `HEADROOM_GRAPH_RELEVANCE` | safe | Expands the task context with files/symbols one or two hops away in a lightweight code graph. |
+| `HEADROOM_RETENTION_LEARNING` | safe | Learns from retrievals which tools' outputs the model keeps needing and compresses those more gently. |
+| `HEADROOM_SPECULATIVE_PREP` | safe | Indexes new tool outputs in the background while the request is in flight. |
+| `HEADROOM_DELTA` | full | A repeated command/listing/search is sent as a delta against its earlier output (original stored for exact recovery). |
+| `HEADROOM_DELTA_READS` | never | Also delta file reads. Off in every posture because agents patch exact bytes. |
+| `HEADROOM_ADMISSION` | full | Huge tool outputs enter context as a task-aware preview plus a verified retrieval marker. |
+| `HEADROOM_BUDGET_ALLOCATOR` | full | Under context pressure, allocates the remaining budget to the blocks that matter most for the task. |
+| `HEADROOM_TOOL_CATALOG` | full | Where native tool search does not apply, keeps relevant tool schemas full and compacts the rest (sticky per conversation, cache-safe). |
+| `HEADROOM_RICH_INTERCEPTORS` | full | Test-runner collapse and richer read outlines with exact CCR originals. |
+| `HEADROOM_EFFORT_ROUTING` | never | Moves an effort field the client already sent (never injects one), with hysteresis. Opt-in only: effort switches cost prompt-cache rewrites. |
+
+Each variable accepts `1/0`, `true/false`, `on/off`, `yes/no` and overrides the
+posture in either direction (e.g. `HEADROOM_INTELLIGENCE=safe` with
+`HEADROOM_DELTA=1`).
+
+### Tunables
+
+| Env var | Default |
+|---|---|
+| `HEADROOM_CCR_EXPANSION_TOKEN_BUDGET` | 1500 |
+| `HEADROOM_ADMISSION_MIN_TOKENS` | 2000 |
+| `HEADROOM_ADMISSION_PREVIEW_TOKENS` | 400 |
+| `HEADROOM_DELTA_MIN_TOKENS` | 200 |
+| `HEADROOM_BUDGET_PRESSURE_THRESHOLD` | 0.5 |
+| `HEADROOM_BUDGET_DIVERSITY_CAP` | 0.6 |
+| `HEADROOM_TOOL_CATALOG_TOP_K` | 5 |
+| `HEADROOM_TOOL_CATALOG_MIN_TOOLS` | 12 |
+| `HEADROOM_GRAPH_MAX_FILES` | 2000 |
+| `HEADROOM_RETENTION_LEARNING_ALPHA` | 0.15 |
+| `HEADROOM_RETENTION_LEARNING_MIN_OBS` | 5 |
+| `HEADROOM_SPECULATIVE_WORKERS` | 2 |
+| `HEADROOM_SPECULATIVE_MAX_PENDING` | 64 |
+| `HEADROOM_INTELLIGENCE_DIR` | `~/.headroom/intelligence` (`%USERPROFILE%\.headroom\intelligence`) |
+
+## Prompt-cache safety
+
+Every decision is pinned, so the same history always forwards the same bytes:
+
+- **Claude Code** — the frozen prefix and `cache_control` blocks are never
+  rewritten; admission/delta decisions are memoized per tool call and content.
+- **Codex** — the Responses path has no frozen-prefix tracker, so the routing
+  inputs of each item (task query, learned bias, review context) are pinned the
+  first time its text is seen. Later turns with a different question reuse the
+  pin and reproduce the identical bytes.
+- The tool catalog's materialized set is sticky per conversation and only grows
+  on a cold cache.
+
+## JevK5 decision advisor (optional)
+
+[JevK5](https://huggingface.co/alibiserikbay/JevK5-GGUF) is a small local model
+that answers multiple-choice/yes-no/score questions. Headroom can consult it for
+ambiguous decisions (arbiter ties, tool materialization, turn complexity). Its
+advice is blended with the deterministic score at a bounded weight (≤ 0.40) and
+can never override a hard invariant or the policy budget. Without it, every
+decision is fully deterministic.
+
+```bash
+headroom intelligence setup     # find or build llama-server, fetch the GGUF, verify
+headroom intelligence status    # features, service state, advisor stats
+headroom intelligence doctor    # diagnose llama-server, model cache, live service
+headroom intelligence stop      # stop the Headroom-owned llama-server
+```
+
+`setup` looks for `llama-server` (`llama-server.exe` on Windows) on `PATH`,
+under `LLAMA_CPP_HOME`, in WinGet/Scoop/Chocolatey locations and in Headroom's
+managed build. If none is found it can build one with CMake (CUDA when `nvcc`
+is present). The model comes from your Hugging Face cache or a resumable,
+SHA-256-verified download. The service binds only to `127.0.0.1` and runs without
+a console window on Windows.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HEADROOM_JEVK5` | `auto` | `auto` uses an installed setup, `on` sets it up (download/build allowed), `off` never uses it |
+| `HEADROOM_JEVK5_URL` | — | Use an already-running llama-server instead of starting one |
+| `HEADROOM_JEVK5_LLAMA_SERVER` | — | Explicit path to `llama-server` / `llama-server.exe` |
+| `HEADROOM_JEVK5_MODEL_REPO` / `_MODEL_FILE` | `alibiserikbay/JevK5-GGUF` / `jevk5-4b-v0.3-Q8_0.gguf` | Model to load |
+| `HEADROOM_JEVK5_GPU_LAYERS` | `auto` | `-ngl` (falls back to CPU once on out-of-memory) |
+| `HEADROOM_JEVK5_CTX` | 8192 | Context size |
+| `HEADROOM_JEVK5_TIMEOUT_MS` | 1200 | Per-decision deadline; late answers are ignored |
+| `HEADROOM_JEVK5_MAX_CALLS_PER_REQUEST` | 4 | Advisor calls per proxied request |
+| `HEADROOM_JEVK5_ADVISORY_WEIGHT` | 0.25 | Blend weight (clamped to 0.40) |
+| `HEADROOM_JEVK5_MIN_CONFIDENCE` | 0.60 | Below this the advice gets zero weight |
+| `HEADROOM_JEVK5_AUTOSTART` | `true` | Start the service with the proxy |
+| `HEADROOM_JEVK5_ALLOW_DOWNLOAD` / `_ALLOW_BUILD` | `true` only for `on` | Permit fetching the model / building llama.cpp |
+
+Proxy flags: `headroom proxy --jevk5 on --jevk5-url http://127.0.0.1:8091 --llama-server C:\tools\llama-server.exe`.
+
+## Observability
+
+- `GET /v1/intelligence/status` (loopback only): resolved features, counters,
+  advisor and retention-learning state. Never includes payloads.
+- `GET /stats` gains an `intelligence` section (arbiter tiers, rejections by
+  reason, tokens saved by source, catalog and effort counters).
+- `GET /health` reports the active posture under `config.intelligence`.
+
+## Rust proxy
+
+The Rust live-zone dispatcher honours the same `HEADROOM_INTELLIGENCE`,
+`HEADROOM_TASK_QUERY`, `HEADROOM_INVARIANT_GUARD` and
+`HEADROOM_POLICY_RISK_BUDGET` variables: the latest user prose becomes the
+relevance query, and a rewrite that drops an unrecoverable invariant or exceeds
+the policy budget is reported as `rejected_by_intelligence` and the original
+is forwarded. `HEADROOM_RUST_EMBEDDINGS=1` loads one process-wide embedding model
+(with an LRU embedding cache) for semantic relevance in the Rust compressors.
+
+## Measured impact
+
+`python benchmarks/intelligence_benchmark.py` runs a deterministic corpus of
+coding-agent tool outputs (failing services in JSON, a failing pytest run, a
+broken cargo build, grep for a definition, two kubectl checks, a long doc, a
+diff, a file read) through the real Claude Code and Codex paths. Every fact the
+task depends on stayed visible or exactly recoverable in every posture.
+
+| Path | Posture | Tokens saved | Facts preserved |
+|---|---|---:|---:|
+| Claude Code | off | 21.0% | 23/23 |
+| Claude Code | safe | 66.1% | 23/23 |
+| Claude Code | full | 67.1% | 23/23 |
+| Codex | off | 22.1% | 23/23 |
+| Codex | safe | 79.7% | 23/23 |
+| Codex | full | 80.0% | 23/23 |
+
+Measured without the ML text compressor (`--kompress` enables it when its
+model is installed); median added latency was under 15 ms per request.

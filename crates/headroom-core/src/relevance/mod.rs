@@ -23,11 +23,13 @@
 mod base;
 mod bm25;
 mod embedding;
+mod embedding_cache;
 mod hybrid;
 
 pub use base::{default_batch_score, RelevanceScore, RelevanceScorer};
 pub use bm25::BM25Scorer;
-pub use embedding::EmbeddingScorer;
+pub use embedding::{embeddings_requested, EmbeddingScorer, EMBEDDINGS_ENV};
+pub use embedding_cache::{EmbeddingCache, DEFAULT_EMBEDDING_CACHE_CAPACITY};
 pub use hybrid::HybridScorer;
 
 /// Factory mirroring Python's `relevance.create_scorer` (`__init__.py:72`).

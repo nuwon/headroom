@@ -392,6 +392,184 @@ impl CompressionPolicy {
     }
 }
 
+// ─── Policy admission (Optimization 13) ─────────────────────────────────
+//
+// Rust twin of `headroom/intelligence/policy.py`. `max_lossy_ratio` and
+// `volatile_token_threshold` become runtime decisions here. Both sides are
+// held in lockstep by `tests/fixtures/intelligence_policy_parity.json`,
+// asserted by `tests/test_intelligence/test_rust_parity.py` (Python) and
+// `policy_admission_matches_python_parity_fixture` below (Rust).
+
+/// Default cap when no policy is supplied (the PAYG value).
+pub const DEFAULT_MAX_LOSSY_RATIO: f64 = 0.45;
+/// Default volatility threshold when no policy is supplied (PAYG).
+pub const DEFAULT_VOLATILE_TOKEN_THRESHOLD: u32 = 128;
+
+/// Wire vs irreversible drop for one candidate.
+///
+/// `wire_drop_ratio` is the fraction of tokens removed from the wire;
+/// `irreversible_drop_ratio` the fraction that cannot be brought back.
+/// Lossless folds and exact CCR externalization (original stored, marker
+/// verified) are `0.0` irreversible however large the wire drop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DropRatios {
+    pub wire_drop_ratio: f64,
+    pub irreversible_drop_ratio: f64,
+}
+
+/// Why a candidate was admitted or rejected (check order is fixed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionReason {
+    Ok,
+    NonPositiveSavings,
+    InvalidMarker,
+    MaxLossyRatio,
+}
+
+impl AdmissionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdmissionReason::Ok => "ok",
+            AdmissionReason::NonPositiveSavings => "non_positive_savings",
+            AdmissionReason::InvalidMarker => "invalid_marker",
+            AdmissionReason::MaxLossyRatio => "max_lossy_ratio",
+        }
+    }
+}
+
+/// Outcome of [`CompressionPolicy::admit_lossy`] / [`admit_with_cap`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Admission {
+    pub allowed: bool,
+    pub reason: AdmissionReason,
+    pub ratios: DropRatios,
+}
+
+/// Whether a content change is cache-stable noise or a real move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeClass {
+    Stable,
+    Volatile,
+}
+
+impl ChangeClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangeClass::Stable => "stable",
+            ChangeClass::Volatile => "volatile",
+        }
+    }
+}
+
+fn round6(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+/// Compute wire vs irreversible drop for a candidate.
+pub fn drop_ratios(
+    original_tokens: usize,
+    candidate_tokens: usize,
+    recoverable: bool,
+    lossless: bool,
+) -> DropRatios {
+    if original_tokens == 0 {
+        return DropRatios {
+            wire_drop_ratio: 0.0,
+            irreversible_drop_ratio: 0.0,
+        };
+    }
+    let wire = original_tokens.saturating_sub(candidate_tokens) as f64 / original_tokens as f64;
+    let irreversible = if lossless || recoverable { 0.0 } else { wire };
+    DropRatios {
+        wire_drop_ratio: round6(wire),
+        irreversible_drop_ratio: round6(irreversible),
+    }
+}
+
+/// The single admission gate for a lossy candidate against `cap`.
+///
+/// Check order (identical in Python):
+/// 1. non-positive token savings      -> `NonPositiveSavings`
+/// 2. recovery claimed, marker broken -> `InvalidMarker`
+/// 3. irreversible drop > cap         -> `MaxLossyRatio`
+pub fn admit_with_cap(
+    cap: f64,
+    original_tokens: usize,
+    candidate_tokens: usize,
+    recoverable: bool,
+    lossless: bool,
+    marker_valid: bool,
+) -> Admission {
+    let ratios = drop_ratios(
+        original_tokens,
+        candidate_tokens,
+        recoverable && marker_valid,
+        lossless,
+    );
+    let reject = |reason| Admission {
+        allowed: false,
+        reason,
+        ratios,
+    };
+    if candidate_tokens >= original_tokens {
+        return reject(AdmissionReason::NonPositiveSavings);
+    }
+    if recoverable && !marker_valid && !lossless {
+        return reject(AdmissionReason::InvalidMarker);
+    }
+    let cap = cap.clamp(0.0, 1.0);
+    if ratios.irreversible_drop_ratio > cap + 1e-9 {
+        return reject(AdmissionReason::MaxLossyRatio);
+    }
+    Admission {
+        allowed: true,
+        reason: AdmissionReason::Ok,
+        ratios,
+    }
+}
+
+/// Classify a change of `changed_tokens` against `threshold`.
+pub fn classify_change_with_threshold(threshold: u32, changed_tokens: usize) -> ChangeClass {
+    if changed_tokens <= threshold as usize {
+        ChangeClass::Stable
+    } else {
+        ChangeClass::Volatile
+    }
+}
+
+impl CompressionPolicy {
+    /// `max_lossy_ratio` as the decimal the table states (the `f32` field
+    /// widened naively would read 0.44999998…, flipping the exact-cap case
+    /// against the Python twin).
+    pub fn max_lossy_ratio_f64(&self) -> f64 {
+        round6(f64::from(self.max_lossy_ratio))
+    }
+
+    /// Policy admission for a lossy candidate (see [`admit_with_cap`]).
+    pub fn admit_lossy(
+        &self,
+        original_tokens: usize,
+        candidate_tokens: usize,
+        recoverable: bool,
+        lossless: bool,
+        marker_valid: bool,
+    ) -> Admission {
+        admit_with_cap(
+            self.max_lossy_ratio_f64(),
+            original_tokens,
+            candidate_tokens,
+            recoverable,
+            lossless,
+            marker_valid,
+        )
+    }
+
+    /// `Stable` when the change is at or below `volatile_token_threshold`.
+    pub fn classify_change(&self, changed_tokens: usize) -> ChangeClass {
+        classify_change_with_threshold(self.volatile_token_threshold, changed_tokens)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +770,64 @@ mod tests {
         let shallow = p.break_even_reads(50_000, 10_000);
         assert!((shallow - 2.3).abs() < 0.05, "break-even = {shallow}");
         assert_eq!(p.break_even_reads(0, 10_000), 0.0);
+    }
+
+    #[test]
+    fn policy_admission_matches_python_parity_fixture() {
+        let raw = include_str!("../../../tests/fixtures/intelligence_policy_parity.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        let policy_for = |name: &str| match name {
+            "payg" => Some(CompressionPolicy::for_mode(AuthMode::Payg)),
+            "subscription" => Some(CompressionPolicy::for_mode(AuthMode::Subscription)),
+            _ => None,
+        };
+        let cases = fixture["admission"].as_array().expect("admission cases");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let orig = case["original_tokens"].as_u64().unwrap() as usize;
+            let cand = case["candidate_tokens"].as_u64().unwrap() as usize;
+            let rec = case["recoverable"].as_bool().unwrap();
+            let lossless = case["lossless"].as_bool().unwrap();
+            let marker = case["marker_valid"].as_bool().unwrap();
+            let got = match policy_for(case["policy"].as_str().unwrap()) {
+                Some(p) => p.admit_lossy(orig, cand, rec, lossless, marker),
+                None => admit_with_cap(DEFAULT_MAX_LOSSY_RATIO, orig, cand, rec, lossless, marker),
+            };
+            assert_eq!(got.allowed, case["allowed"].as_bool().unwrap(), "{case}");
+            assert_eq!(
+                got.reason.as_str(),
+                case["reason"].as_str().unwrap(),
+                "{case}"
+            );
+            assert!(
+                (got.ratios.wire_drop_ratio - case["wire_drop_ratio"].as_f64().unwrap()).abs()
+                    < 1e-9,
+                "{case}"
+            );
+            assert!(
+                (got.ratios.irreversible_drop_ratio
+                    - case["irreversible_drop_ratio"].as_f64().unwrap())
+                .abs()
+                    < 1e-9,
+                "{case}"
+            );
+        }
+        for case in fixture["classify_change"].as_array().expect("change cases") {
+            let n = case["changed_tokens"].as_u64().unwrap() as usize;
+            let got = match policy_for(case["policy"].as_str().unwrap()) {
+                Some(p) => p.classify_change(n),
+                None => classify_change_with_threshold(DEFAULT_VOLATILE_TOKEN_THRESHOLD, n),
+            };
+            assert_eq!(got.as_str(), case["class"].as_str().unwrap(), "{case}");
+        }
+    }
+
+    #[test]
+    fn max_lossy_ratio_f64_is_the_table_decimal() {
+        let payg = CompressionPolicy::for_mode(AuthMode::Payg);
+        assert_eq!(payg.max_lossy_ratio_f64(), 0.45);
+        // Exactly at the cap is admitted (f32 widening would reject it).
+        assert!(payg.admit_lossy(1000, 550, false, false, true).allowed);
+        assert!(!payg.admit_lossy(1000, 549, false, false, true).allowed);
     }
 }
