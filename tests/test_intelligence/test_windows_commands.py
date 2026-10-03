@@ -67,3 +67,30 @@ def test_windows_searches_fold_losslessly(command):
 def test_powershell_tool_names_are_shells():
     names = ContentRouterConfig().bash_tool_names
     assert {"powershell", "pwsh", "shell_command"} <= names
+
+
+def test_relative_shell_read_resolves_against_workdir():
+    from headroom.intelligence.resources import resource_for
+
+    a = resource_for("shell_command", {"command": "type src\\app.py", "workdir": "C:\\dev\\repoA"})
+    b = resource_for("shell_command", {"command": "type src\\app.py", "workdir": "C:\\dev\\repoB"})
+    assert a is not None and b is not None
+    # Same relative name in two checkouts must be two resources (never a
+    # delta base for each other).
+    assert a.identity != b.identity
+    assert a.identity == "file:c:/dev/repoa/src/app.py#cmd"
+    # An absolute target ignores the workdir.
+    c = resource_for(
+        "shell",
+        {
+            "command": [
+                "powershell.exe",
+                "-Command",
+                "Get-Content -Path C:\\dev\\repoA\\src\\app.py",
+            ],
+            "workdir": "D:\\elsewhere",
+        },
+    )
+    assert c is not None and c.identity == a.identity
+    posix = resource_for("exec_command", {"cmd": "cat src/app.py", "workdir": "/home/u/repo"})
+    assert posix is not None and posix.identity == "file:/home/u/repo/src/app.py#cmd"

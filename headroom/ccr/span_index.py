@@ -102,9 +102,20 @@ _DEF_RE = re.compile(
 )
 _TRACE_START_RE = re.compile(
     r"^(?:Traceback \(most recent call last\)|Exception in thread|panicked at|thread '.*' panicked|"
-    r"_{3,} .* _{3,}|={3,} FAILURES ={3,}|FAIL[: ]|ERROR[: ]|Caused by:)",
+    r"_{3,} .* _{3,}|={3,} FAILURES ={3,}|FAIL[: ]|ERROR[: ]|Caused by:|"
+    # Compiler / package-manager failures (rustc, gcc/clang, tsc, npm).
+    r"error(?:\[[A-Za-z]*\d+\])?: |error TS\d+:|fatal error:|npm ERR!)",
     re.M,
 )
+# Build / compiler output that carries no log-level words.
+_BUILD_LINE_RE = re.compile(
+    r"^(?:\s*(?:Compiling|Building|Checking|Linking|Finished|Downloading|Installing)\s|"
+    r"(?:error|warning)(?:\[[A-Za-z]*\d+\])?: |\s*--> \S+:\d+)",
+    re.M,
+)
+# Prose paragraphs longer than this are split into line windows so a
+# preview or a search hit can point at part of them.
+PROSE_SPLIT_CHARS = 1200
 
 
 def detect_kind(text: str) -> str:
@@ -133,8 +144,10 @@ def detect_kind(text: str) -> str:
         return "search"
     if len(_DEF_RE.findall(head)) >= 3:
         return "code"
-    if _TRACE_START_RE.search(head) or re.search(
-        r"\b(?:INFO|WARN|DEBUG|ERROR|PASSED|FAILED)\b", head
+    if (
+        _TRACE_START_RE.search(head)
+        or re.search(r"\b(?:INFO|WARN|DEBUG|ERROR|PASSED|FAILED)\b", head)
+        or len(_BUILD_LINE_RE.findall(head)) >= 3
     ):
         return "log"
     return "prose"
@@ -349,14 +362,33 @@ def _log_spans(text: str) -> list[Span]:
 
 
 def _prose_spans(text: str) -> list[Span]:
-    spans: list[Span] = []
+    bounds: list[tuple[int, int]] = []
     cursor = 0
     for m in re.finditer(r"\n\s*\n", text):
         if m.end() - cursor > 0:
-            spans.append(Span(len(spans), cursor, m.end(), "paragraph", ""))
+            bounds.append((cursor, m.end()))
             cursor = m.end()
     if cursor < len(text):
-        spans.append(Span(len(spans), cursor, len(text), "paragraph", ""))
+        bounds.append((cursor, len(text)))
+    spans: list[Span] = []
+    for start, end in bounds:
+        if end - start <= PROSE_SPLIT_CHARS:
+            spans.append(Span(len(spans), start, end, "paragraph", ""))
+            continue
+        # Oversized paragraph (often line-oriented output with no blank
+        # lines): split at line boundaries into windows. Exact tiling.
+        piece_start = start
+        line_start = start
+        while line_start < end:
+            nl = text.find("\n", line_start, end)
+            line_end = end if nl < 0 else nl + 1
+            lines_in_piece = text.count("\n", piece_start, line_end)
+            if line_end - piece_start >= PROSE_SPLIT_CHARS or lines_in_piece >= LOG_WINDOW_LINES:
+                spans.append(Span(len(spans), piece_start, line_end, "paragraph", ""))
+                piece_start = line_end
+            line_start = line_end
+        if piece_start < end:
+            spans.append(Span(len(spans), piece_start, end, "paragraph", ""))
     return spans
 
 

@@ -123,6 +123,10 @@ def _read_target_from_command(command: str) -> str | None:
     return candidates[-1] if candidates else None
 
 
+# Absolute on either OS: "C:\\x", "C:/x", "\\\\server\\share", "/x", "~/x".
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]|~)")
+
+
 def resource_for(tool_name: str, tool_input: dict[str, Any] | None) -> ResourceRef | None:
     """Return the stable resource identity for a tool invocation, or None."""
     tool_input = tool_input or {}
@@ -165,6 +169,11 @@ def resource_for(tool_name: str, tool_input: dict[str, Any] | None) -> ResourceR
             return None
         target = _read_target_from_command(command)
         if target:
+            workdir = _first(tool_input, "workdir", "cwd", "working_directory")
+            if workdir and not _ABSOLUTE_PATH_RE.match(target.strip("'\"")):
+                # Codex passes relative paths plus a per-call workdir; the
+                # same relative name in two checkouts is two resources.
+                target = workdir.rstrip("\\/") + "/" + target.strip("'\"")
             path = canonical_path(target)
             return ResourceRef(f"file:{path}#cmd", "file", True, path)
         from headroom.transforms.content_router import _strip_cd_prefix

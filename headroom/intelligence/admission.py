@@ -144,7 +144,10 @@ def store_and_verify(
 # acts on them whatever the task wording ("failing" vs a row's "error").
 _SIGNAL_RE = re.compile(
     r"\b(?:error|errors|errored|fail|failed|failing|failure|failures|fatal|panic|"
-    r"exception|traceback|denied|refused|timed?\s?out|timeout|critical|crash(?:ed)?)\b",
+    r"exception|traceback|denied|refused|timed?\s?out|timeout|critical|crash(?:ed)?|"
+    # Orchestrator / process states (kubectl, docker, systemd).
+    r"crashloop\w*|oomkilled|\w*backoff|errimagepull|evicted|unhealthy|degraded|"
+    r"unreachable|killed|terminated|exited)\b",
     re.IGNORECASE,
 )
 _MAX_SIGNAL_SPANS = 64
