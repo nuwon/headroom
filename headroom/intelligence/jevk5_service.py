@@ -45,6 +45,7 @@ from .state import (
     read_runtime,
     read_setup,
     record_runtime,
+    service_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -245,7 +246,7 @@ class JevK5Service:
         wait_timeout_s: float = 120.0,
     ) -> ServiceStatus:
         """Start (or adopt) the decision service. Idempotent, never raises."""
-        with self._lock:
+        with self._lock, service_lock():
             if self.settings.mode == "off":
                 self._status = ServiceStatus("disabled", reason="HEADROOM_JEVK5=off")
                 return self._status

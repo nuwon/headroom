@@ -250,3 +250,32 @@ def test_selective_proactive_expansion(monkeypatch):
     # Selective disabled -> legacy full behavior.
     legacy = ContextTracker(ContextTrackerConfig()).execute_expansions([rec], query="INV-88231")
     assert legacy[0]["type"] == "full"
+
+
+def test_light_stemming_matches_inflections_both_ways():
+    from headroom.ccr.span_index import _stem, _tokens
+
+    assert _stem("services") == "service"
+    assert _stem("failing") == "fail" and _stem("failed") == "fail"
+    assert _stem("dependencies") == "dependency"
+    assert _stem("status") == "status" and _stem("process") == "process"
+    toks = _tokens("Failing services")
+    assert {"failing", "fail", "services", "service"} <= set(toks)
+
+
+def test_preview_surfaces_failure_rows_when_query_terms_are_ubiquitous():
+    import json
+
+    from headroom.intelligence.admission import build_preview
+    from headroom.intelligence.task_context import build_task_context, detect_provenance
+
+    rows = [
+        {"id": i, "service": f"svc-{i:03d}", "status": "error" if i in (7, 41) else "ok"}
+        for i in range(80)
+    ]
+    text = json.dumps(rows, indent=1)
+    task = build_task_context([{"role": "user", "content": "which services are failing?"}])
+    preview = build_preview(text, task, preview_chars=1600, provenance=detect_provenance(text))
+    assert preview.matched >= 2
+    assert "svc-007" in preview.text and "svc-041" in preview.text
+    assert preview.text.count("omitted") <= 4  # separators rendered inline, not as markers

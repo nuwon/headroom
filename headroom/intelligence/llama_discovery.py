@@ -201,7 +201,8 @@ def _run(cmd: list[str], timeout: float) -> tuple[int, str]:
         proc = _subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             creationflags=no_window_flags(),
             stdin=subprocess.DEVNULL,

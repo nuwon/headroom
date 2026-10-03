@@ -50,15 +50,16 @@ def _mirror_prompt_text(state: Any, criterion: str, options: list[str]) -> str:
 
 
 def _mirror_decision_options(question: dict[str, Any]) -> list[tuple[str, str]]:
-    crit = question.get("criteria")
+    crit: Any = question.get("criteria")
+    pairs: list[tuple[str, str]]
     if question["type"] == "noul":
         pairs = [(k, (crit or {}).get(k) or f"The proposition is {k}.") for k in ("true", "false")]
     elif question["type"] == "choice":
         if isinstance(crit, list):
             crit = dict.fromkeys(crit)
-        pairs = [(k, v or k) for k, v in crit.items()]
+        pairs = [(k, v or k) for k, v in (crit or {}).items()]
     else:
-        pairs = [(str(i), level) for i, level in enumerate(crit)]
+        pairs = [(str(i), level) for i, level in enumerate(crit or [])]
     return [(k, f"{k}: {d}") for k, d in pairs]
 
 

@@ -275,6 +275,12 @@ class ProxyConfig:
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
 
+    # Context intelligence (headroom.intelligence.config.IntelligenceConfig).
+    # None = every intelligence feature off (deterministic legacy behavior).
+    # Resolved once from HEADROOM_INTELLIGENCE / per-feature env vars /
+    # HEADROOM_JEVK5* or the --intelligence / --jevk5 CLI flags.
+    intelligence: Any = None
+
     # Per-tool compression profiles
     tool_profiles: dict[str, Any] | None = None
 

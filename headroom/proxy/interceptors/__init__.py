@@ -35,6 +35,8 @@ def enable_rich_interception(enabled: bool = True) -> None:
     _astgrep.set_rich_mode(enabled)
     if enabled:
         _test_runner.enable()
+    else:
+        _test_runner.disable()
 
 
 __all__ = [

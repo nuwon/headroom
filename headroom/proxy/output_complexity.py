@@ -312,8 +312,13 @@ class EffortRouter:
             if target == current:
                 self._state[key] = (current, 0)
                 result = current
-            elif decision.reason == "complex_turn":
-                # Raising for a hard turn is immediate (quality first).
+            elif decision.reason == "complex_turn" or (
+                target in EFFORT_ORDER
+                and current in EFFORT_ORDER
+                and EFFORT_ORDER.index(target) > EFFORT_ORDER.index(current)
+            ):
+                # Raising — for a hard turn or back to the client's own
+                # level — is immediate (quality first).
                 self._state[key] = (target, 0)
                 result = target
             else:

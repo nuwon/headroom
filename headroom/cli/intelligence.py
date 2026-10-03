@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+from typing import Any
 
 import click
 
@@ -203,6 +204,7 @@ def intelligence_gateway(port: int) -> None:
     from headroom.intelligence.jevk5_service import get_service
 
     _cfg, settings = _settings()
+    client: Any
     if settings.external:
         client = SystemOneClient(settings.url, timeout_s=settings.timeout_ms / 1000)
     else:

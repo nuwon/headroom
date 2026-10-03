@@ -222,7 +222,7 @@ class ArbiterWeights:
     latency: float = 0.05
 
     def total(self) -> float:
-        return sum(getattr(self, f.name) for f in fields(self))
+        return float(sum(float(getattr(self, f.name)) for f in fields(self)))
 
     def validate(self) -> None:
         if abs(self.total() - 1.0) > 1e-9:
@@ -393,6 +393,27 @@ class IntelligenceConfig:
 
     def with_overrides(self, **overrides: Any) -> IntelligenceConfig:
         return replace(self, **overrides)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> IntelligenceConfig:
+        """Rebuild from :func:`dataclasses.asdict`-style JSON (multi-worker handoff)."""
+        if isinstance(data, IntelligenceConfig):
+            return data
+        if not isinstance(data, dict):
+            return cls()
+        known = {f.name for f in fields(cls)}
+        values = {k: v for k, v in data.items() if k in known}
+        weights = values.get("arbiter_weights")
+        if isinstance(weights, dict):
+            wf = {f.name for f in fields(ArbiterWeights)}
+            values["arbiter_weights"] = ArbiterWeights(
+                **{k: v for k, v in weights.items() if k in wf}
+            )
+        jevk5 = values.get("jevk5")
+        if isinstance(jevk5, dict):
+            jf = {f.name for f in fields(JevK5Settings)}
+            values["jevk5"] = JevK5Settings(**{k: v for k, v in jevk5.items() if k in jf})
+        return cls(**values)
 
 
 def jevk5_settings_from_env(env: Mapping[str, str]) -> JevK5Settings:

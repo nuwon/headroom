@@ -17,11 +17,14 @@ half-written record, on Windows or POSIX.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -148,3 +151,52 @@ def clear_runtime() -> None:
         pass
     except OSError as exc:
         logger.debug("could not remove runtime record: %s", exc)
+
+
+@contextlib.contextmanager
+def service_lock(timeout_s: float = 30.0) -> Iterator[bool]:
+    """Cross-process lock around service check-then-launch.
+
+    ``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows. Yields True when
+    the lock was acquired, False on timeout (callers proceed but may race —
+    the runtime-record reuse check still prevents most duplicates).
+    """
+    path = intelligence_dir() / "service.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+b")  # noqa: SIM115 - closed in finally
+    acquired = False
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()

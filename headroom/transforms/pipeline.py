@@ -103,6 +103,7 @@ class TransformPipeline:
         config: HeadroomConfig | None = None,
         transforms: list[Transform] | None = None,
         provider: Provider | None = None,
+        intelligence: Any | None = None,
     ):
         """
         Initialize pipeline.
@@ -111,9 +112,14 @@ class TransformPipeline:
             config: Headroom configuration.
             transforms: Optional custom transform list (overrides config).
             provider: Provider for model-specific behavior.
+            intelligence: Optional :class:`~headroom.intelligence.runtime.IntelligenceRuntime`.
+                When set, each ``apply`` first builds the request's TaskContext
+                and derives the task-conditioned relevance query and per-message
+                biases (fail-open: any error keeps the deterministic kwargs).
         """
         self.config = config or HeadroomConfig()
         self._provider = provider
+        self._intelligence = intelligence
 
         if transforms is not None:
             self.transforms = transforms
@@ -261,6 +267,44 @@ class TransformPipeline:
         tokenizer = self._get_tokenizer(model)
         provider_name = self._provider_name()
 
+        intelligence = self._intelligence
+        if intelligence is not None and getattr(intelligence.config, "any_enabled", False):
+            kwargs = intelligence.prepare_request(
+                messages, kwargs, provider=provider_name or "", model=model
+            )
+            with intelligence.request_scope():
+                return self._apply(
+                    messages,
+                    model,
+                    tokenizer,
+                    provider_name,
+                    record_metrics,
+                    waste_messages,
+                    waste_signal_token_limit,
+                    kwargs,
+                )
+        return self._apply(
+            messages,
+            model,
+            tokenizer,
+            provider_name,
+            record_metrics,
+            waste_messages,
+            waste_signal_token_limit,
+            kwargs,
+        )
+
+    def _apply(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        tokenizer: Tokenizer,
+        provider_name: str | None,
+        record_metrics: Any,
+        waste_messages: Any,
+        waste_signal_token_limit: int,
+        kwargs: dict[str, Any],
+    ) -> TransformResult:
         # Get model limit from kwargs (should be set by client)
         model_limit = kwargs.get("model_limit")
         if model_limit is None:

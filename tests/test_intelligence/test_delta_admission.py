@@ -266,7 +266,7 @@ class TestExternalization:
     def test_partial_output_keeps_truncation_notice(self):
         body = "\n\n".join(f"note {i} about things" for i in range(2000)) + "\n\n(output truncated)"
         msgs = [
-            {"role": "user", "content": "summarize"},
+            {"role": "user", "content": "what does `note 1500` say?"},
             *tool_turn("p1", "Fetch", {"url": "x"}, body),
         ]
         res = run(
@@ -277,6 +277,24 @@ class TestExternalization:
         )
         out = result_text(res.messages, 2)
         assert "partial input" in out and "truncated" in out
+        assert "note 1500 about things" in out
+
+    def test_preview_without_task_match_or_signal_is_not_offered(self):
+        # Nothing in the output relates to the task and nothing failed: a
+        # head sample would hide content blindly, so the deterministic router
+        # keeps ownership of it.
+        body = "\n\n".join(f"paragraph {i} lorem ipsum" for i in range(2000))
+        msgs = [
+            {"role": "user", "content": "summarize"},
+            *tool_turn("p2", "Fetch", {"url": "y"}, body),
+        ]
+        res = run(
+            IntelligencePrepTransform(
+                cfg(HEADROOM_DELTA="0"), store_provider=lambda: CompressionStore()
+            ),
+            msgs,
+        )
+        assert res.messages == msgs
 
     def test_read_never_externalized(self):
         code = "\n".join(f"def g{i}():\n    pass" for i in range(3000))

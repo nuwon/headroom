@@ -152,3 +152,12 @@ def enable() -> None:
     if not _REGISTERED:
         base.register(TestRunnerInterceptor())
         _REGISTERED = True
+
+
+def disable() -> None:
+    """Unregister the interceptor (idempotent)."""
+    global _REGISTERED
+    base.INTERCEPTORS[:] = [
+        i for i in base.INTERCEPTORS if not isinstance(i, TestRunnerInterceptor)
+    ]
+    _REGISTERED = False

@@ -1061,6 +1061,27 @@ class HeadroomProxy(
                 return router_config
             return replace(router_config, enable_kompress=not kompress_disabled)
 
+        # Context intelligence (HEADROOM_INTELLIGENCE / per-feature env /
+        # --intelligence). Built once here and injected; None keeps every
+        # request path byte-identical to the deterministic proxy.
+        self.intelligence = _build_intelligence_runtime(config)
+        icfg = self.intelligence.config if self.intelligence is not None else None
+        if icfg is not None and (icfg.invariant_guard or icfg.policy_budget or icfg.arbiter):
+            router_config.intelligence = self.intelligence
+        # Process-wide switches: set on every construction (on AND off) so a
+        # proxy built later in the same process never inherits a stale value.
+        from headroom.ccr.tool_injection import set_ccr_search_enabled
+        from headroom.proxy.interceptors import enable_rich_interception
+
+        set_ccr_search_enabled(
+            bool(icfg is not None and icfg.ccr_search and router_config.ccr_inject_marker)
+        )
+        enable_rich_interception(bool(icfg is not None and icfg.rich_interceptors))
+        if self.intelligence is None:
+            from headroom.intelligence.runtime import install_runtime
+
+            install_runtime(None)
+
         cache_aligner = CacheAligner(CacheAlignerConfig(enabled=False))
         anthropic_router = ContentRouter(
             _router_config_for(anthropic_kompress_disabled), observer=self.metrics
@@ -1079,13 +1100,30 @@ class HeadroomProxy(
 
             _intercept_prefix = [ToolResultInterceptorTransform()]
 
+        _intel_prep: list = []
+        if self.intelligence is not None and (
+            self.intelligence.config.delta or self.intelligence.config.admission
+        ):
+            from headroom.intelligence.admission import IntelligencePrepTransform
+
+            _intel_prep = [
+                IntelligencePrepTransform(
+                    self.intelligence.config,
+                    advisor_provider=self.intelligence.advisor_or_none,
+                    feedback=self.intelligence.learner,
+                    markers_enabled=router_config.ccr_inject_marker,
+                )
+            ]
+
         self.anthropic_pipeline = TransformPipeline(
-            transforms=[*_intercept_prefix, cache_aligner, anthropic_router],
+            transforms=[*_intercept_prefix, *_intel_prep, cache_aligner, anthropic_router],
             provider=self.anthropic_provider,
+            intelligence=self.intelligence,
         )
         self.openai_pipeline = TransformPipeline(
-            transforms=[*_intercept_prefix, cache_aligner, openai_router],
+            transforms=[*_intercept_prefix, *_intel_prep, cache_aligner, openai_router],
             provider=self.openai_provider,
+            intelligence=self.intelligence,
         )
         # Build the DEFAULT /v1/compress pipeline now, not on first request.
         # It is a ContentRouter derived from `openai_router` (marker-free), so
@@ -1344,12 +1382,17 @@ class HeadroomProxy(
         )
 
         # CCR Context Tracker (tracks compressed content across turns)
+        _intel_cfg = self.intelligence.config if self.intelligence is not None else None
         self.ccr_context_tracker = (
             ContextTracker(
                 ContextTrackerConfig(
                     enabled=True,
                     proactive_expansion=config.ccr_proactive_expansion,
                     max_proactive_expansions=config.ccr_max_proactive_expansions,
+                    selective_expansion=bool(_intel_cfg and _intel_cfg.ccr_selective_expansion),
+                    expansion_token_budget=(
+                        _intel_cfg.ccr_expansion_token_budget if _intel_cfg is not None else 1500
+                    ),
                 )
             )
             if config.ccr_context_tracking
@@ -1998,6 +2041,9 @@ class HeadroomProxy(
     async def startup(self):
         """Initialize async resources."""
         self._get_shutdown_event().clear()
+        if getattr(self, "intelligence", None) is not None:
+            # Starts JevK5 in the background when configured; never blocks.
+            self.intelligence.start()
         self.pipeline_extensions.emit(
             PipelineStage.PRE_START,
             operation="proxy.startup",
@@ -2309,6 +2355,10 @@ class HeadroomProxy(
     async def shutdown(self):
         """Cleanup async resources."""
         self._get_shutdown_event().set()
+        if getattr(self, "intelligence", None) is not None:
+            # Saves learned priors and stops a Headroom-owned llama-server.
+            with contextlib.suppress(Exception):
+                self.intelligence.shutdown()
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -3682,6 +3732,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "cloudcode_api_url": config.cloudcode_api_url,
                 "vertex_api_url": config.vertex_api_url,
                 "savings_profile": config.savings_profile,
+                "intelligence": (getattr(config.intelligence, "level", None) or "off"),
                 "target_ratio": effective_target_ratio,
                 "target_savings_percent": (
                     round(max(0.0, min(1.0, 1.0 - float(effective_target_ratio))) * 100, 1)
@@ -5209,6 +5260,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
+        runtime = getattr(proxy, "intelligence", None)
+        if runtime is not None:
+            # Counters only (no payloads); safe for network callers too.
+            with contextlib.suppress(Exception):
+                payload = {**payload, "intelligence": runtime.metrics.snapshot()}
         return payload
 
     @app.get("/stats-lifetime")
@@ -5456,6 +5512,40 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 store.get_entry_status(hash_key, clean_expired=True)
             ),
         )
+
+    @app.get("/v1/intelligence/status", dependencies=[Depends(_require_loopback)])
+    async def intelligence_status():
+        """Resolved intelligence features, metrics, advisor/learner state (no payloads)."""
+        runtime = getattr(proxy, "intelligence", None)
+        if runtime is None:
+            from headroom.intelligence.config import IntelligenceConfig
+
+            cfg = proxy.config.intelligence
+            cfg = IntelligenceConfig.from_dict(cfg) if isinstance(cfg, dict) else cfg
+            return {"config": (cfg or IntelligenceConfig()).to_dict(), "enabled": False}
+        return {"enabled": True, **runtime.status()}
+
+    @app.post("/v1/intelligence/systemone", dependencies=[Depends(_require_loopback)])
+    async def intelligence_systemone(request: Request):
+        """Loopback JevK5 decision gateway (TypeSafe /v1/systemone shape)."""
+        from fastapi.responses import JSONResponse
+
+        from headroom.intelligence.decision_gateway import MAX_BODY_BYTES, answer_batch
+
+        runtime = getattr(proxy, "intelligence", None)
+        advisor = runtime.advisor if runtime is not None else None
+        client = advisor._resolve_client() if advisor is not None else None  # noqa: SLF001
+        if client is None:
+            return JSONResponse({"error": "decision model unavailable"}, status_code=503)
+        raw = await request.body()
+        if len(raw) > MAX_BODY_BYTES:
+            return JSONResponse({"error": "body too large"}, status_code=413)
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        status, payload = await asyncio.to_thread(answer_batch, client, body)
+        return JSONResponse(payload, status_code=status)
 
     @app.get("/v1/retrieve/stats", dependencies=[Depends(_require_loopback)])
     async def ccr_stats():
@@ -5947,6 +6037,37 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     return app
 
 
+def _build_intelligence_runtime(config: ProxyConfig) -> Any:
+    """IntelligenceRuntime for ``config`` or None (all features off)."""
+    from headroom.intelligence.config import IntelligenceConfig
+
+    icfg = config.intelligence
+    if icfg is None:
+        return None
+    if isinstance(icfg, dict):
+        icfg = IntelligenceConfig.from_dict(icfg)
+        config.intelligence = icfg
+    if not (icfg.any_enabled or icfg.advisor_enabled):
+        return None
+    try:
+        from headroom.intelligence.runtime import IntelligenceRuntime, install_runtime
+
+        runtime = IntelligenceRuntime(icfg)
+        install_runtime(runtime)
+        logger.info(
+            "Context intelligence: posture=%s features=%s jevk5=%s",
+            icfg.level,
+            ",".join(k for k, v in icfg.to_dict().items() if v is True) or "none",
+            icfg.jevk5.mode,
+        )
+        return runtime
+    except Exception:  # noqa: BLE001 - never block proxy startup
+        logger.warning(
+            "Context intelligence failed to initialize; continuing without it", exc_info=True
+        )
+        return None
+
+
 def _json_ready(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return {field.name: _json_ready(getattr(value, field.name)) for field in fields(value)}
@@ -6034,17 +6155,26 @@ def _proxy_config_from_env() -> ProxyConfig:
                 values["rollout"] = RolloutSnapshot.from_internal_dict(rollout_value)
             if "profile_seeded_env_keys" in values:
                 values["profile_seeded_env_keys"] = frozenset(values["profile_seeded_env_keys"])
+            if isinstance(values.get("intelligence"), dict):
+                from headroom.intelligence.config import IntelligenceConfig
+
+                values["intelligence"] = IntelligenceConfig.from_dict(values["intelligence"])
             return ProxyConfig(**values)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
                 "Invalid %s; falling back to HEADROOM_* env vars", _MULTI_WORKER_CONFIG_ENV
             )
 
+    from headroom.intelligence.config import IntelligenceConfig
     from headroom.rollout import resolve_rollout
 
-    rollout = resolve_rollout()
+    intelligence = IntelligenceConfig.from_env()
+    rollout = resolve_rollout(
+        requested=("tool_result_interceptors",) if intelligence.rich_interceptors else ()
+    )
     return ProxyConfig(
         rollout=rollout,
+        intelligence=intelligence,
         host=_get_env_str("HEADROOM_HOST", "127.0.0.1"),
         port=_get_env_int("HEADROOM_PORT", 8787),
         openai_api_url=os.environ.get("OPENAI_TARGET_API_URL"),
@@ -6197,6 +6327,16 @@ def run_server(
     config.profile_seeded_env_keys = frozenset(
         set(config.profile_seeded_env_keys) | set(seeded_env_keys)
     )
+    if config.intelligence is None or any(
+        key == "HEADROOM_INTELLIGENCE" or key.startswith("HEADROOM_JEVK5")
+        for key in seeded_env_keys
+    ):
+        # The savings profile seeds the intelligence posture into the env just
+        # above; resolve again so the profile default reaches this config (an
+        # explicit env/CLI value was already in os.environ and still wins).
+        from headroom.intelligence.config import IntelligenceConfig
+
+        config.intelligence = IntelligenceConfig.from_env()
     if workers < 1:
         raise ValueError("workers must be >= 1")
     config.worker_processes = workers

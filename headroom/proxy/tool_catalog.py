@@ -112,7 +112,8 @@ def compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(schema, dict):
         return {"type": "object", "properties": {}}
     required = [r for r in schema.get("required", []) if isinstance(r, str)]
-    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    raw_props = schema.get("properties")
+    props: dict[str, Any] = raw_props if isinstance(raw_props, dict) else {}
     out_props: dict[str, Any] = {}
     for name in required:
         spec = props.get(name)

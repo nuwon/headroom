@@ -365,12 +365,36 @@ def _prose_spans(text: str) -> list[Span]:
 # ---------------------------------------------------------------------------
 
 
+def _stem(tok: str) -> str:
+    """Light, deterministic suffix stripping (services->service, failing->fail).
+
+    Applied identically to indexed spans and queries, so it only ever adds
+    matches between inflections; the exact token is always kept as well.
+    """
+    if not tok.isalpha() or len(tok) < 5:
+        return tok
+    if tok.endswith("ies") and len(tok) > 5:
+        return tok[:-3] + "y"
+    if tok.endswith("ing") and len(tok) > 6:
+        return tok[:-3]
+    if tok.endswith("ed") and len(tok) > 5:
+        return tok[:-2]
+    if tok.endswith("es") and tok[:-2].endswith(("s", "x", "z", "ch", "sh")):
+        return tok[:-2]
+    if tok.endswith("s") and not tok.endswith(("ss", "us", "is")):
+        return tok[:-1]
+    return tok
+
+
 def _tokens(text: str) -> list[str]:
     out: list[str] = []
     for tok in _TOKEN_RE.findall(text.lower()):
         if tok in _STOP or len(tok) < 2:
             continue
         out.append(tok)
+        stem = _stem(tok)
+        if stem != tok:
+            out.append(stem)
         if any(c in tok for c in "./-:"):
             out.extend(p for p in re.split(r"[./\-:]", tok) if len(p) >= 2 and p not in _STOP)
     return out
@@ -653,7 +677,7 @@ def selective_retrieve(
         return {**base, **index.summary(), "original_chars": len(original)}
     if args.mode == "range":
         ordinals = _parse_range(args.range, len(index.spans))
-        chosen = [(index.spans[o], None) for o in ordinals]
+        chosen: list[tuple[Span, float | None]] = [(index.spans[o], None) for o in ordinals]
         has_more = False
         next_cursor = ""
     else:

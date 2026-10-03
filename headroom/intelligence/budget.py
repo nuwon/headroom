@@ -185,14 +185,14 @@ def allocate(
     target = available * pressure_threshold
     remaining = float(target)
     cap = diversity_cap * target
-    mandatory = sorted(
+    mandatory_blocks = sorted(
         (b for b in blocks if b.mandatory), key=lambda b: (-b.value, b.message_index)
     )
-    optional = sorted(
+    optional_blocks = sorted(
         (b for b in blocks if not b.mandatory),
         key=lambda b: (-(b.value / max(1, b.tokens)), b.message_index),
     )
-    for group in (mandatory, optional):
+    for group in (mandatory_blocks, optional_blocks):
         for b in group:
             grant = min(float(b.tokens), cap, max(0.0, remaining))
             b.keep_fraction = grant / b.tokens if b.tokens else 1.0

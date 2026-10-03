@@ -3205,6 +3205,21 @@ class AnthropicHandlerMixin:
                         f"{_ts_saved_tokens}tok"
                     )
 
+            # Progressive tool catalog (HEADROOM_TOOL_CATALOG, "full" posture):
+            # only when native deferral did not apply (third-party upstream,
+            # cloud backend, HEADROOM_TOOL_SEARCH=0). Sticky per conversation;
+            # the set grows only on a cold prefix cache.
+            if not _bypass and body.get("tools"):
+                from headroom.intelligence.turn_routing import apply_tool_catalog
+
+                _catalog_labels = apply_tool_catalog(
+                    body, "anthropic", cache_cold=int(frozen_message_count or 0) == 0
+                )
+                if _catalog_labels:
+                    tools = body.get("tools")
+                    body_mutation_tracker.mark_mutated("intelligence_tool_catalog")
+                    transforms_applied.extend(_catalog_labels)
+
             # Turn hooks (opt-in extensions): a registered hook may inspect or
             # rewrite the outbound tools/messages before we send upstream — the
             # extensible counterpart to the built-in deferral above. A single
@@ -3410,6 +3425,7 @@ class AnthropicHandlerMixin:
             # body mutation so the turn classifier sees the final messages,
             # and respects the same bypass header as compression.
             if not _bypass:
+                from headroom.intelligence.turn_routing import adjust_verbosity, route_effort
                 from headroom.proxy.output_savings import (
                     assign_arm,
                     conversation_key_from_body,
@@ -3423,6 +3439,14 @@ class AnthropicHandlerMixin:
                     resolve_verbosity_level,
                     shape_request,
                 )
+
+                # Complexity-aware effort routing (HEADROOM_EFFORT_ROUTING=1
+                # only): moves an effort the client already sent, with
+                # per-conversation hysteresis. Independent of the shaper.
+                _effort_labels = route_effort(body, "anthropic", conversation_key_from_body(body))
+                if _effort_labels:
+                    body_mutation_tracker.mark_mutated("intelligence_effort")
+                    transforms_applied.extend(_effort_labels)
 
                 _shaper_settings = OutputShaperSettings.from_env(
                     enabled=(shaper_enabled_for(getattr(self, "config", None))),
@@ -3461,6 +3485,8 @@ class AnthropicHandlerMixin:
 
                     if _arm == "treatment":
                         _level, _src = resolve_verbosity_level(_shaper_settings)
+                        _level, _verbosity_labels = adjust_verbosity(body, "anthropic", _level)
+                        transforms_applied.extend(_verbosity_labels)
                         shape_result = shape_request(body, _shaper_settings, level_override=_level)
                         if shape_result.changed:
                             body_mutation_tracker.mark_mutated("output_shaper")

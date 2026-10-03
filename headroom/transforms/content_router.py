@@ -2074,6 +2074,13 @@ class ContentRouterConfig:
     # Default False; the proxy enables it in token mode.
     search_group_by_file: bool = False
 
+    # Intelligence runtime (headroom.intelligence.runtime.IntelligenceRuntime).
+    # None (default) keeps routing byte-identical to the deterministic router.
+    # When set, every compressor result passes the invariant guard, the
+    # max_lossy_ratio policy gate and (if enabled) the multi-candidate
+    # Transform Arbiter before the router's own acceptance gates run.
+    intelligence: Any | None = None
+
 
 @dataclass
 class _PerRequestRuntimeState:
@@ -2120,6 +2127,8 @@ class _PerRequestRuntimeState:
     """
 
     compression_policy: Any = None
+    # TaskContext for this request (intelligence layer); None when disabled.
+    task_context: Any = None
     target_ratio: float | None = None
     force_kompress: bool = False
     skip_kompress: bool = False
@@ -2768,13 +2777,272 @@ class ContentRouter(Transform):
         context: str,
         bias: float,
         precomputed_detection: DetectionResult | None = None,
+        tool_name: str = "",
     ) -> tuple[RouterCompressionResult, float]:
         """Compress with wall-clock timing.  Used by parallel executor."""
         t0 = time.perf_counter()
         result = self.compress(
             content, context=context, bias=bias, precomputed_detection=precomputed_detection
         )
+        result = self._intelligence_review(
+            content, result, context=context, bias=bias, tool_name=tool_name
+        )
         return result, (time.perf_counter() - t0) * 1000
+
+    def _intelligence_review(
+        self,
+        content: str,
+        result: RouterCompressionResult,
+        *,
+        context: str,
+        bias: float,
+        tool_name: str = "",
+        task: Any = None,
+    ) -> RouterCompressionResult:
+        """Invariant guard + policy admission + Transform Arbiter (fail-open).
+
+        The router's own result is one candidate; with the arbiter enabled a
+        byte-lossless fold and a task-relevant indexed externalization (exact
+        original stored + verified in CCR) compete with it, and a conservative
+        re-compression is generated when the router's result fails a hard
+        invariant (the backoff ladder). The original is the Pareto baseline:
+        if no candidate is safe and positive-value, the content passes through
+        unchanged. Returning a result never bypasses the router's own
+        downstream gates (min_ratio, reversibility, net-cost).
+        """
+        runtime = self.config.intelligence
+        if runtime is None or not content:
+            return result
+        cfg = runtime.config
+        if not (cfg.invariant_guard or cfg.policy_budget or cfg.arbiter):
+            return result
+        try:
+            from headroom.intelligence.arbiter import (
+                TIER_AGGRESSIVE,
+                TIER_CONSERVATIVE,
+                TIER_INDEXED,
+                TIER_STRUCTURAL,
+                ArbiterSession,
+                Candidate,
+            )
+            from headroom.intelligence.task_context import EMPTY_TASK_CONTEXT, detect_provenance
+
+            task = task or self._get_local_runtime_state().task_context or EMPTY_TASK_CONTEXT
+            policy = self._runtime_compression_policy
+            chain = list(getattr(result, "strategy_chain", None) or [])
+            router_changed = (
+                result.compressed != content
+                and result.strategy_used != CompressionStrategy.PASSTHROUGH
+            )
+            router_lossless = bool(chain) and all(c.startswith("lossless_") for c in chain)
+            candidates: list[Any] = []
+            if router_changed:
+                candidates.append(
+                    Candidate(
+                        "router",
+                        "+".join(chain) or result.strategy_used.value,
+                        result.compressed,
+                        tier=TIER_STRUCTURAL if router_lossless else TIER_AGGRESSIVE,
+                        lossless=router_lossless,
+                    )
+                )
+            markers_ok = self.config.ccr_inject_marker and not self.config.lossless
+            store = None
+            if cfg.arbiter:
+                try:
+                    folded, flabel = self._lossless_first(content, result.strategy_used)
+                except Exception:  # noqa: BLE001
+                    folded, flabel = content, None
+                if flabel and folded != content and folded != result.compressed:
+                    candidates.append(
+                        Candidate("lossless", flabel, folded, tier=TIER_STRUCTURAL, lossless=True)
+                    )
+                if markers_ok and _estimate_tokens(content) >= max(
+                    600, cfg.admission_min_tokens // 2
+                ):
+                    store = self._intel_store()
+                    ext = self._intel_externalize(content, task, tool_name, store, cfg)
+                    if ext is not None:
+                        candidates.append(
+                            Candidate("indexed", "indexed_preview", ext, tier=TIER_INDEXED)
+                        )
+            if not candidates:
+                return result
+            if store is None and markers_ok:
+                store = self._intel_store()
+            provenance = detect_provenance(content)
+            learner = getattr(runtime, "learner", None)
+            prior = (
+                (lambda strat: learner.prior_for_strategy(tool_name, strat))
+                if learner is not None
+                else None
+            )
+
+            def _session(cands: list[Any]) -> Any:
+                sess = ArbiterSession(
+                    content,
+                    count_tokens=_estimate_tokens,
+                    task=task,
+                    policy=policy,
+                    weights=cfg.arbiter_weights,
+                    store_has=(lambda h: bool(store.exists(h))) if store is not None else None,
+                    prior_lookup=prior,
+                    provenance=provenance,
+                    content_type=(
+                        result.routing_log[0].content_type.value if result.routing_log else ""
+                    ),
+                    enforce_invariants=cfg.invariant_guard,
+                    enforce_policy=cfg.policy_budget,
+                )
+                sess.prepare(cands)
+                return sess
+
+            session = _session(candidates)
+            router_cand = next((c for c in session.candidates if c.candidate_id == "router"), None)
+            if (
+                cfg.arbiter
+                and router_cand is not None
+                and router_cand.rejected_reason
+                and router_cand.rejected_reason.startswith("invariant:")
+            ):
+                # Backoff ladder: aggressive -> conservative re-compression.
+                conservative = self.compress(content, context=context, bias=max(1.6, bias * 1.6))
+                if conservative.compressed not in (content, result.compressed):
+                    candidates.append(
+                        Candidate(
+                            "conservative",
+                            f"{conservative.strategy_used.value}:conservative",
+                            conservative.compressed,
+                            tier=TIER_CONSERVATIVE,
+                        )
+                    )
+                    session = _session(candidates)
+            advice = None
+            advisor = runtime.advisor_or_none() if cfg.arbiter else None
+            if advisor is not None:
+                request = session.advisory_request()
+                if request is not None:
+                    advice = advisor.advise(request)
+            decision = session.select(advice)
+            self._intel_record(runtime, decision)
+            selected = decision.selected
+            if learner is not None and not selected.is_original:
+                from headroom.intelligence.feedback import feature_key
+
+                for h in selected.ccr_hashes:
+                    learner.note_compressed(
+                        h, feature_key(tool_name, selected.strategy), advised=decision.advised
+                    )
+            if selected.candidate_id == "router":
+                return result
+            content_type = (
+                result.routing_log[0].content_type if result.routing_log else ContentType.PLAIN_TEXT
+            )
+            if selected.is_original:
+                return RouterCompressionResult(
+                    compressed=content,
+                    original=content,
+                    strategy_used=CompressionStrategy.PASSTHROUGH,
+                    routing_log=[
+                        RoutingDecision(
+                            content_type=content_type,
+                            strategy=CompressionStrategy.PASSTHROUGH,
+                            original_tokens=selected.original_tokens,
+                            compressed_tokens=selected.original_tokens,
+                        )
+                    ],
+                    strategy_chain=[*chain, "intel:kept_original"],
+                )
+            strategy = (
+                result.strategy_used
+                if result.strategy_used != CompressionStrategy.PASSTHROUGH
+                else CompressionStrategy.TEXT
+            )
+            return RouterCompressionResult(
+                compressed=selected.content,
+                original=content,
+                strategy_used=strategy,
+                routing_log=[
+                    RoutingDecision(
+                        content_type=content_type,
+                        strategy=strategy,
+                        original_tokens=selected.original_tokens,
+                        compressed_tokens=selected.candidate_tokens,
+                    )
+                ],
+                strategy_chain=[selected.strategy],
+            )
+        except Exception:  # noqa: BLE001 - intelligence never breaks routing
+            logger.debug("intelligence review failed; keeping router result", exc_info=True)
+            return result
+
+    def _intel_store(self) -> Any:
+        try:
+            from ..cache.compression_store import get_compression_store
+
+            return get_compression_store()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _intel_externalize(
+        self, content: str, task: Any, tool_name: str, store: Any, cfg: Any
+    ) -> str | None:
+        """Indexed-externalization candidate: exact excerpts + verified CCR marker."""
+        if store is None:
+            return None
+        from headroom.intelligence.admission import _marker, build_preview, store_and_verify
+        from headroom.intelligence.task_context import detect_provenance
+
+        provenance = detect_provenance(content)
+        body, shown, total, matched = build_preview(
+            content, task, preview_chars=cfg.admission_preview_tokens * 4, provenance=provenance
+        )
+        if total <= 1 or shown >= total or matched == 0:
+            return None
+        preview = (
+            f"headroom preview: {shown} of {total} exact excerpts selected for the current task"
+            + (" [partial input]" if provenance.is_partial else "")
+            + f".\n{body}"
+        )
+        h = store_and_verify(
+            store,
+            content,
+            compressed=preview,
+            original_tokens=_estimate_tokens(content),
+            compressed_tokens=_estimate_tokens(preview),
+            tool_name=tool_name or None,
+            tool_call_id=None,
+            query=getattr(task, "current_user_text", "")[:500],
+            strategy="indexed_preview",
+            partial=provenance.is_partial,
+        )
+        if h is None:
+            return None
+        return preview + _marker(h, f"{total - shown} excerpts omitted")
+
+    @staticmethod
+    def _intel_record(runtime: Any, decision: Any) -> None:
+        metrics = getattr(runtime, "metrics", None)
+        if metrics is None:
+            return
+        metrics.bump("arbiter_decisions")
+        metrics.bump("tiers", decision.tier_name)
+        if decision.kept_original:
+            metrics.bump("arbiter_kept_original")
+        if decision.advised:
+            metrics.bump("arbiter_advised")
+        for reason, count in decision.rejections.items():
+            metrics.bump("rejections", reason, count)
+        sel = decision.selected
+        if not sel.is_original and sel.tokens_saved > 0:
+            source = (
+                "lossless"
+                if sel.lossless
+                else "ccr_externalization"
+                if sel.tier == 4
+                else "query_aware_compression"
+            )
+            metrics.bump("tokens_saved_by_source", source, sel.tokens_saved)
 
     def compress(
         self,
@@ -5615,6 +5883,7 @@ class ContentRouter(Transform):
         # pass a policy — ``_record_to_toin`` treats that as "no gate"
         # to preserve pre-F2.2 behaviour for non-proxy callers.
         self._runtime_compression_policy = kwargs.get("compression_policy")
+        self._get_local_runtime_state().task_context = kwargs.get("task_context")
         # Cross-turn dedup recoverability gate. The fold rewrites a repeated
         # span to a bare in-context pointer (``[↑NL same as msg M]``) that names
         # Headroom's internal message index. That reference is only resolvable
@@ -6001,6 +6270,7 @@ class ContentRouter(Transform):
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
                     prefix_replay_guaranteed=prefix_replay_guaranteed,
                     protect_prompt_text=prompt_turn,
+                    message_bias=float(hook_biases.get(i, 1.0)),
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -6354,6 +6624,12 @@ class ContentRouter(Transform):
             )
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
+        def _slot_tool_name(slot: int) -> str:
+            msg = messages[slot]
+            return tool_name_map.get(msg.get("tool_call_id") or "", "") or str(
+                msg.get("name") or ""
+            )
+
         if pending_tasks:
             max_workers = min(
                 len(pending_tasks), int(os.environ.get("HEADROOM_COMPRESS_WORKERS", "4"))
@@ -6363,8 +6639,17 @@ class ContentRouter(Transform):
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
+                for (
+                    task_slot,
+                    task_content,
+                    task_ctx,
+                    task_bias,
+                    _,
+                    _,
+                    task_detection,
+                ) in pending_tasks:
                     t0 = time.perf_counter()
+                    task_tool = _slot_tool_name(task_slot)
                     deadline_s = _compression_deadline_seconds() if len(pending_tasks) == 1 else 0.0
                     if deadline_s:
                         box: dict[str, Any] = {}
@@ -6375,13 +6660,20 @@ class ContentRouter(Transform):
                             _context: str = task_ctx,
                             _bias: float = task_bias,
                             _detection: DetectionResult | None = task_detection,
+                            _tool: str = task_tool,
                         ) -> None:
                             try:
-                                _box["result"] = self.compress(
+                                _box["result"] = self._intelligence_review(
                                     _content,
+                                    self.compress(
+                                        _content,
+                                        context=_context,
+                                        bias=_bias,
+                                        precomputed_detection=_detection,
+                                    ),
                                     context=_context,
                                     bias=_bias,
-                                    precomputed_detection=_detection,
+                                    tool_name=_tool,
                                 )
                             except BaseException as exc:  # noqa: BLE001
                                 _box["error"] = exc
@@ -6422,11 +6714,17 @@ class ContentRouter(Transform):
                         else:
                             r = box["result"]
                     else:
-                        r = self.compress(
+                        r = self._intelligence_review(
                             task_content,
+                            self.compress(
+                                task_content,
+                                context=task_ctx,
+                                bias=task_bias,
+                                precomputed_detection=task_detection,
+                            ),
                             context=task_ctx,
                             bias=task_bias,
-                            precomputed_detection=task_detection,
+                            tool_name=task_tool,
                         )
                     compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
@@ -6443,7 +6741,15 @@ class ContentRouter(Transform):
                 # `_timed_compress` inside it on the worker thread.
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
-                    for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
+                    for (
+                        task_slot,
+                        task_content,
+                        task_ctx,
+                        task_bias,
+                        _,
+                        _,
+                        task_detection,
+                    ) in pending_tasks:
                         _task_ctx_snapshot = copy_context()
                         futures.append(
                             executor.submit(
@@ -6453,6 +6759,7 @@ class ContentRouter(Transform):
                                 task_ctx,
                                 task_bias,
                                 task_detection,
+                                _slot_tool_name(task_slot),
                             )
                         )
                     task_results = [f.result() for f in futures]
@@ -7005,6 +7312,7 @@ class ContentRouter(Transform):
         compress_assistant_text_blocks: bool = False,
         prefix_replay_guaranteed: bool = False,
         protect_prompt_text: bool = False,
+        message_bias: float = 1.0,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -7207,9 +7515,11 @@ class ContentRouter(Transform):
                         continue
                     # Old excluded-tool output — fall through to compression
 
-                # Look up tool-specific compression bias
+                # Look up tool-specific compression bias, times the per-message
+                # bias (hooks / intelligence budget allocator), which used to
+                # reach string messages only.
                 tool_name = (tool_name_map or {}).get(tool_use_id, "")
-                bias = self._get_tool_bias(tool_name) if tool_name else 1.0
+                bias = (self._get_tool_bias(tool_name) if tool_name else 1.0) * message_bias
 
                 # Enrich the relevance query with the triggering tool call's
                 # args (grep pattern, read path, …) — the sharpest, per-output
@@ -7317,6 +7627,7 @@ class ContentRouter(Transform):
                         strategy_label="tool_result",
                         details_prefix="tool",
                         enforce_reversibility=True,
+                        tool_name=tool_name,
                     )
                     if compressed_content is not None:
                         new_blocks.append(
@@ -7420,6 +7731,7 @@ class ContentRouter(Transform):
         strategy_label: str,
         details_prefix: str,
         enforce_reversibility: bool = False,
+        tool_name: str = "",
     ) -> tuple[str | None, bool]:
         """Apply two-tier cache lookup + compression to a single content string.
 
@@ -7523,7 +7835,13 @@ class ContentRouter(Transform):
         if route_counts is not None:
             route_counts["cache_miss"] = route_counts.get("cache_miss", 0) + 1
         t0 = time.perf_counter()
-        result = self.compress(content, context=context, bias=bias)
+        result = self._intelligence_review(
+            content,
+            self.compress(content, context=context, bias=bias),
+            context=context,
+            bias=bias,
+            tool_name=tool_name,
+        )
         compress_ms = (time.perf_counter() - t0) * 1000
         if compressor_timing is not None:
             key = f"compressor:{result.strategy_used.value}"

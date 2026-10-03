@@ -130,7 +130,8 @@ class GGUFDecisionClient:
 
     def decide(self, state: Any, question: dict[str, Any]) -> dict[str, Any]:
         probs, tokens = self.probabilities(state, question)
-        return proto.answer(question, probs, tokens)
+        answer: dict[str, Any] = proto.answer(question, probs, tokens)
+        return answer
 
 
 class SystemOneClient:

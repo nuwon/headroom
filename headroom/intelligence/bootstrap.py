@@ -126,7 +126,8 @@ def ensure_jevk5_package(
         proc = _subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
             creationflags=no_window_flags(),
             stdin=subprocess.DEVNULL,

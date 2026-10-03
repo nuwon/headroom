@@ -31,7 +31,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 from headroom.config import DEFAULT_VERBATIM_EXCLUDE_TOOLS, TransformResult, is_tool_excluded
 from headroom.tokenizer import Tokenizer
@@ -140,66 +140,117 @@ def store_and_verify(
         return None
 
 
+# Spans carrying a failure/error signal are always worth showing: the agent
+# acts on them whatever the task wording ("failing" vs a row's "error").
+_SIGNAL_RE = re.compile(
+    r"\b(?:error|errors|errored|fail|failed|failing|failure|failures|fatal|panic|"
+    r"exception|traceback|denied|refused|timed?\s?out|timeout|critical|crash(?:ed)?)\b",
+    re.IGNORECASE,
+)
+_MAX_SIGNAL_SPANS = 64
+_TRIVIAL_CHARS = " \t\r\n,;[](){}"
+
+
+class Preview(NamedTuple):
+    text: str
+    shown: int
+    total: int
+    # Spans kept because they match the task or carry a failure signal. A
+    # preview with ``matched == 0`` is just a head sample: callers do not
+    # offer it as a candidate (the deterministic router handles the content).
+    matched: int
+
+
 def build_preview(
     original: str,
     task: TaskContext,
     *,
     preview_chars: int,
     provenance: Provenance,
-) -> tuple[str, int, int]:
-    """Query-aware preview of exact excerpts: ``(text, spans_shown, total)``."""
+) -> Preview:
+    """Query-aware preview of exact excerpts."""
     from headroom.ccr.span_index import INDEX_CACHE, rank_spans
 
     index = INDEX_CACHE.get_or_build(content_hash(original), original)
     spans = index.spans
     if not spans:
-        return original[:preview_chars], 1, 1
-    chosen: set[int] = {0}
+        return Preview(original[:preview_chars], 1, 1, 0)
     ranked = rank_spans(index, original, task.relevance_query(), exact_terms=task.explicit_entities)
-    for r in ranked:
-        chosen.add(r.span.ordinal)
+    signal: list[int] = []
     for s in spans:
-        if s.item_type == "failure_block":
-            chosen.add(s.ordinal)
-    chosen.add(spans[-1].ordinal)
-    priority = (
-        [0]
-        + [r.span.ordinal for r in ranked]
-        + [s.ordinal for s in spans if s.item_type == "failure_block"]
-        + [spans[-1].ordinal]
-    )
+        if s.item_type == "failure_block" or _SIGNAL_RE.search(original[s.start : s.end]):
+            signal.append(s.ordinal)
+            if len(signal) >= _MAX_SIGNAL_SPANS:
+                break
+    trivial = {sp.ordinal for sp in spans if not original[sp.start : sp.end].strip(_TRIVIAL_CHARS)}
+    relevant = [r.span.ordinal for r in ranked]
+    substantive = len(spans) - len(trivial)
+    if substantive > 10 and len(relevant) > 0.6 * substantive:
+        # A term present in nearly every span ranks nothing by itself: keep
+        # only spans scoring clearly above that baseline (a discriminative
+        # term matched), else a few for orientation, and let failure
+        # signals lead.
+        scores = sorted(r.score for r in ranked)
+        median = scores[len(scores) // 2]
+        strong = [r.span.ordinal for r in ranked if r.score >= median * 1.25]
+        relevant = strong[:12] if strong else relevant[:3]
+    informative = set(relevant) | set(signal)
+    # Interleave so both the best task match and the first failure make the
+    # cut when the budget is tight.
+    merged: list[int] = []
+    for pair in zip(relevant, signal):
+        merged.extend(pair)
+    merged.extend(relevant[len(signal) :])
+    merged.extend(signal[len(relevant) :])
+    priority = [0, *merged, spans[-1].ordinal]
+    if not informative:
+        priority.extend(s.ordinal for s in spans[1:-1])  # head sample
     kept: list[int] = []
     used = 0
     for ordinal in dict.fromkeys(priority):
-        if ordinal not in chosen:
-            continue
         size = spans[ordinal].end - spans[ordinal].start
         if used + size > preview_chars and kept:
             continue
         kept.append(ordinal)
         used += size
+    matched = sum(1 for o in kept if o in informative)
     kept.sort()
+    # Separator-only gaps (",", "]", blank lines) are rendered verbatim
+    # instead of as omission markers: cheaper, and the excerpt keeps the
+    # original's exact shape.
+    filled = set(kept)
+    for a, b in zip(kept, kept[1:]):
+        if b - a > 1 and all(o in trivial for o in range(a + 1, b)):
+            filled.update(range(a + 1, b))
+    runs: list[tuple[int, int]] = []
+    for ordinal in sorted(filled):
+        if runs and runs[-1][1] == ordinal - 1:
+            runs[-1] = (runs[-1][0], ordinal)
+        else:
+            runs.append((ordinal, ordinal))
+
+    def _omitted(lo: int, hi: int) -> str:
+        n = sum(1 for o in range(lo, hi) if o not in trivial)
+        return f"… [{n} span{'s' if n != 1 else ''} omitted] …\n" if n else ""
+
     parts: list[str] = []
     prev = -1
-    for ordinal in kept:
-        gap = ordinal - prev - 1
-        if gap > 0:
-            parts.append(f"… [{gap} span{'s' if gap != 1 else ''} omitted] …\n")
-        span = spans[ordinal]
-        text = original[span.start : span.end]
+    for lo, hi in runs:
+        parts.append(_omitted(prev + 1, lo))
+        text = original[spans[lo].start : spans[hi].end]
         parts.append(text if text.endswith("\n") else text + "\n")
-        prev = ordinal
-    tail_gap = len(spans) - 1 - prev
-    if tail_gap > 0:
-        parts.append(f"… [{tail_gap} span{'s' if tail_gap != 1 else ''} omitted] …\n")
+        prev = hi
+    parts.append(_omitted(prev + 1, len(spans)))
     body = "".join(parts)
+    kept = [o for o in kept if o not in trivial]
+    total_spans = sum(1 for sp in spans if sp.ordinal not in trivial)
     if (
         provenance.is_partial
         and provenance.truncation_boundary
         and provenance.truncation_boundary not in body
     ):
         body += f"[partial input: {provenance.truncation_boundary}]\n"
-    return body, len(kept), len(spans)
+    return Preview(body, len(kept), max(1, total_spans), matched)
 
 
 AdvisorFn = Callable[..., Any]
@@ -476,7 +527,7 @@ class IntelligencePrepTransform(Transform):
             and self._prefer_preview(env, tokens, task)
         ):
             preview_chars = self.config.admission_preview_tokens * 4
-            body, shown, total = build_preview(
+            preview_body, shown, total, matched = build_preview(
                 text, task, preview_chars=preview_chars, provenance=env.provenance
             )
             header = (
@@ -485,19 +536,23 @@ class IntelligencePrepTransform(Transform):
                 + (" [partial input]" if env.provenance.is_partial else "")
                 + "."
             )
-            preview = f"{header}\n{body}"
-            h = store_and_verify(
-                store,
-                text,
-                compressed=preview,
-                original_tokens=tokens,
-                compressed_tokens=tokenizer.count_text(preview),
-                tool_name=ref.tool_name or None,
-                tool_call_id=ref.call_id or None,
-                query=query,
-                strategy="indexed_preview",
-                partial=env.provenance.is_partial,
-            )
+            preview = f"{header}\n{preview_body}"
+            # A preview with no task match and no failure signal is only a
+            # head sample; leave such content to the deterministic router.
+            h = None
+            if matched > 0 and shown < total:
+                h = store_and_verify(
+                    store,
+                    text,
+                    compressed=preview,
+                    original_tokens=tokens,
+                    compressed_tokens=tokenizer.count_text(preview),
+                    tool_name=ref.tool_name or None,
+                    tool_call_id=ref.call_id or None,
+                    query=query,
+                    strategy="indexed_preview",
+                    partial=env.provenance.is_partial,
+                )
             if h is not None:
                 candidates.append(
                     Candidate(
@@ -569,4 +624,4 @@ class IntelligencePrepTransform(Transform):
         p_preview = scores.probabilities.get("indexed_preview", 0.5)
         # Blend with the deterministic prior exactly like the arbiter does.
         blended = (1 - scores.weight) * (1.0 if default else 0.0) + scores.weight * p_preview
-        return blended >= 0.5
+        return bool(blended >= 0.5)
