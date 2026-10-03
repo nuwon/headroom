@@ -490,6 +490,8 @@ def build_task_context(
     call_index = build_tool_call_index(messages)
     user_text = ""
     turn_kind = "unknown"
+    if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "tool":
+        turn_kind = "tool_continuation"  # OpenAI chat / Responses (Codex) shape
     for idx in range(len(messages) - 1, -1, -1):
         msg = messages[idx]
         if not isinstance(msg, dict) or msg.get("role") != "user":

@@ -220,3 +220,73 @@ def is_tool_result_only(msg: dict[str, Any]) -> bool:
             if not (text.startswith("<system-reminder>") and text.endswith("</system-reminder>")):
                 return False
     return saw_result
+
+
+def responses_items_to_messages(items: Any) -> list[dict[str, Any]]:
+    """Adapt OpenAI Responses ``input`` items (Codex) to chat-shaped messages.
+
+    Read-only view for analysis (TaskContext, complexity): ``message`` items
+    become role/content messages, ``function_call``/``custom_tool_call``/
+    ``local_shell_call`` become assistant ``tool_calls`` and their ``*_output``
+    items become ``role: tool`` messages. Never used to rewrite the wire body.
+    """
+    if isinstance(items, str):
+        return [{"role": "user", "content": items}]
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        itype = item.get("type", "message" if "role" in item else None)
+        if itype == "message":
+            content = item.get("content")
+            if isinstance(content, list):
+                text = "\n".join(
+                    str(part.get("text", ""))
+                    for part in content
+                    if isinstance(part, dict)
+                    and part.get("type") in ("input_text", "output_text", "text")
+                )
+            else:
+                text = content if isinstance(content, str) else ""
+            role = item.get("role", "user")
+            out.append({"role": "system" if role == "developer" else role, "content": text})
+        elif itype in ("function_call", "custom_tool_call", "local_shell_call"):
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            name = str(item.get("name") or ("local_shell" if itype == "local_shell_call" else ""))
+            if itype == "local_shell_call":
+                action = item.get("action") or {}
+                args: Any = json.dumps({"command": action.get("command", [])})
+            else:
+                args = item.get("arguments", item.get("input", "{}"))
+                if not isinstance(args, str):
+                    args = json.dumps(args)
+            out.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": args},
+                        }
+                    ],
+                }
+            )
+        elif itype in (
+            "function_call_output",
+            "custom_tool_call_output",
+            "local_shell_call_output",
+            "apply_patch_call_output",
+        ):
+            output = item.get("output", "")
+            if isinstance(output, list):
+                output = "\n".join(str(p.get("text", "")) for p in output if isinstance(p, dict))
+            elif not isinstance(output, str):
+                output = json.dumps(output)
+            out.append(
+                {"role": "tool", "tool_call_id": str(item.get("call_id") or ""), "content": output}
+            )
+    return out
