@@ -63,6 +63,14 @@ def looks_like_claude_code_compact_summary(*texts: str | None) -> bool:
     )
 
 
+# An explicit ask for the complete earlier output overrides selective expansion.
+_FULL_REQUEST_RE = re.compile(
+    r"\b(?:full|entire|complete|whole|unabridged|raw)\s+(?:output|result|results|log|file|listing|response|content)\b"
+    r"|\ball of (?:the|it)\b|\bshow (?:me )?everything\b",
+    re.I,
+)
+
+
 @dataclass
 class CompressedContext:
     """Represents a piece of compressed context from the conversation.
@@ -120,6 +128,13 @@ class ContextTrackerConfig:
 
     # Maximum items to proactively expand per turn
     max_proactive_expansions: int = 2
+
+    # Indexed/partial expansion (Optimization 3): restore the top relevant
+    # exact spans within ``expansion_token_budget`` instead of whole originals.
+    # Full restoration still happens when the user explicitly asks for the
+    # complete prior output, or when the original already fits the budget.
+    selective_expansion: bool = False
+    expansion_token_budget: int = 1500
 
 
 class ContextTracker:
@@ -491,11 +506,15 @@ class ContextTracker:
     def execute_expansions(
         self,
         recommendations: list[ExpansionRecommendation],
+        *,
+        query: str = "",
     ) -> list[dict[str, Any]]:
         """Execute expansion recommendations and return the expanded content.
 
         Args:
             recommendations: List of expansion recommendations.
+            query: The current user query. With ``selective_expansion`` on it
+                drives span search so only relevant exact spans come back.
 
         Returns:
             List of expanded content dicts with hash, content, and metadata.
@@ -503,7 +522,21 @@ class ContextTracker:
         store = get_compression_store()
         results = []
 
+        selective = self.config.selective_expansion and bool(query.strip())
+        wants_full = bool(_FULL_REQUEST_RE.search(query or ""))
+        budget_chars = max(0, self.config.expansion_token_budget) * 4
+
         for rec in recommendations:
+            if selective and not wants_full:
+                expanded = self._selective_expansion(store, rec, query, budget_chars)
+                if expanded is not None:
+                    results.append(expanded)
+                    budget_chars -= sum(len(sp["text"]) for sp in expanded.get("spans", ())) + len(
+                        expanded.get("content", "")
+                    )
+                    if budget_chars <= 0:
+                        break
+                continue
             try:
                 # Retrieval is by hash: proactive expansion always restores the
                 # full original content (no partial/search expansion).
@@ -526,6 +559,58 @@ class ContextTracker:
                 logger.warning(f"CCR Tracker: Failed to expand {rec.hash_key}: {e}")
 
         return results
+
+    def _selective_expansion(
+        self,
+        store: Any,
+        rec: ExpansionRecommendation,
+        query: str,
+        budget_chars: int,
+    ) -> dict[str, Any] | None:
+        from .span_index import RetrieveArgs
+
+        if budget_chars <= 0:
+            return None
+        try:
+            result = store.retrieve_selective(
+                rec.hash_key,
+                RetrieveArgs(rec.hash_key, mode="search", query=query, top_k=8),
+                max_chars=budget_chars,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"CCR Tracker: selective expansion failed for {rec.hash_key}: {e}")
+            return None
+        if result is None:
+            return None
+        spans = result.get("spans") or []
+        if not spans:
+            # Search could not localize anything: restore the whole original
+            # only when it is small enough to fit the budget.
+            original = result.get("original_content")
+            if original is None:
+                entry = store.retrieve(rec.hash_key)
+                original = entry.original_content if entry else None
+            if original is not None and len(original) <= budget_chars:
+                return {
+                    "hash": rec.hash_key,
+                    "type": "full",
+                    "content": original,
+                    "item_count": result.get("original_item_count", 0),
+                    "reason": rec.reason,
+                }
+            return None
+        logger.info(
+            f"CCR Tracker: Selectively expanded {rec.hash_key} "
+            f"({len(spans)} of {result.get('total_spans', '?')} spans)"
+        )
+        return {
+            "hash": rec.hash_key,
+            "type": "spans",
+            "spans": spans,
+            "total_spans": result.get("total_spans", 0),
+            "has_more": bool(result.get("has_more")),
+            "reason": rec.reason,
+        }
 
     def format_expansions_for_context(
         self,
@@ -557,7 +642,16 @@ class ContextTracker:
         parts = [header]
 
         for exp in expansions:
-            # Expansions are always full (retrieval is by hash).
+            if exp.get("type") == "spans":
+                ordinals = ", ".join(str(sp["ordinal"]) for sp in exp["spans"])
+                parts.append(
+                    f"\n--- Relevant excerpts from earlier ({exp['reason']}; spans {ordinals} of "
+                    f"{exp.get('total_spans', '?')}; exact text. More: "
+                    f'headroom_retrieve(hash="{exp["hash"]}", query=...) ) ---'
+                )
+                for sp in exp["spans"]:
+                    parts.append(sp["text"])
+                continue
             parts.append(f"\n--- Expanded from earlier ({exp['reason']}) ---")
             parts.append(exp["content"])
 

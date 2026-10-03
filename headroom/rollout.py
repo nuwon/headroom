@@ -98,7 +98,11 @@ class FeatureSpec:
 FEATURES: dict[str, FeatureSpec] = {
     "tool_result_interceptors": FeatureSpec(
         name="tool_result_interceptors",
-        available_in=RolloutChannel.CANARY,
+        # Promoted from CANARY: available on the stable channel, still opt-in.
+        # HEADROOM_INTERCEPT_ENABLED=1, --intercept-tool-results or
+        # HEADROOM_FEATURES=tool_result_interceptors turns it on; no channel
+        # switch or unsafe override is needed.
+        available_in=RolloutChannel.STABLE,
         legacy_env=("HEADROOM_INTERCEPT_ENABLED",),
         description="AST-aware Read/tool-result interceptors used before compression.",
     ),
@@ -118,6 +122,15 @@ FEATURES: dict[str, FeatureSpec] = {
         available_in=RolloutChannel.BETA,
         legacy_env=("HEADROOM_READ_MATURATION",),
         description="Hold-back Read maturation before provider cache entry.",
+    ),
+    "canary_probe": FeatureSpec(
+        name="canary_probe",
+        # No runtime behavior. Mirrors the Rust registry's probe so the
+        # channel-gating engine is exercised by the shared Python/Rust policy
+        # vectors without pinning a real feature to the canary channel.
+        available_in=RolloutChannel.CANARY,
+        legacy_env=("HEADROOM_CANARY_PROBE",),
+        description="Policy-engine probe (no runtime behavior).",
     ),
     "bedrock_openai_prompt_caching": FeatureSpec(
         name="bedrock_openai_prompt_caching",

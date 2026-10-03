@@ -210,7 +210,7 @@ class RetrievalEvent:
     total_items: int
     tool_name: str | None
     timestamp: float
-    retrieval_type: str  # always "full" (retrieval is by hash)
+    retrieval_type: str  # "full", or a selective mode: "search" | "range" | "metadata"
     tool_signature_hash: str | None = None  # For TOIN correlation
 
 
@@ -459,12 +459,17 @@ class CompressionStore:
         self,
         hash_key: str,
         query: str | None = None,
+        *,
+        retrieval_type: str = "full",
     ) -> CompressionEntry | None:
         """Retrieve original content by hash.
 
         Args:
             hash_key: Hash key returned by store().
             query: Optional query for feedback tracking.
+            retrieval_type: ``full`` (default) or the selective mode
+                (``search``/``range``/``metadata``) the caller is serving;
+                recorded on the retrieval event for feedback learning.
 
         Returns:
             CompressionEntry if found and not expired, None otherwise.
@@ -494,13 +499,13 @@ class CompressionStore:
                     items_retrieved=entry.original_item_count,
                     total_items=entry.original_item_count,
                     tool_name=entry.tool_name,
-                    retrieval_type="full",
+                    retrieval_type=retrieval_type,
                     tool_signature_hash=entry.tool_signature_hash,
                 )
             self._log_retrieval_payload(
                 hash_key=hash_key,
                 query=query,
-                retrieval_type="full",
+                retrieval_type=retrieval_type,
                 payload=entry.original_content,
                 items_retrieved=entry.original_item_count,
                 total_items=entry.original_item_count,
@@ -516,7 +521,70 @@ class CompressionStore:
         if self._enable_feedback:
             self.process_pending_feedback()
 
+        _notify_retrieval_listeners(result_entry, retrieval_type)
         return result_entry
+
+    def retrieve_selective(
+        self,
+        hash_key: str,
+        args: Any,
+        *,
+        exact_terms: Any = (),
+        prior: Any = None,
+        semantic: Any = None,
+        max_chars: int = 24_000,
+    ) -> dict[str, Any] | None:
+        """Indexed/partial retrieval (``headroom.ccr.span_index``).
+
+        ``args`` is a :class:`~headroom.ccr.span_index.RetrieveArgs`. ``full``
+        mode returns the exact original, unchanged from :meth:`retrieve`;
+        ``search``/``range``/``metadata`` answer from a span index over the
+        exact original, so every returned span is a verbatim slice of it.
+        Returns ``None`` when the entry is missing or expired.
+        """
+        entry = self.retrieve(
+            hash_key, query=getattr(args, "query", None) or None, retrieval_type=args.mode
+        )
+        if entry is None:
+            return None
+        common = {
+            "original_tokens": entry.original_tokens,
+            "original_item_count": entry.original_item_count,
+            "compressed_item_count": entry.compressed_item_count,
+            "tool_name": entry.tool_name,
+            "retrieval_count": entry.retrieval_count,
+        }
+        if args.mode == "full":
+            return {
+                "hash": hash_key,
+                "mode": "full",
+                "original_content": entry.original_content,
+                **common,
+            }
+        from ..ccr.span_index import selective_retrieve
+
+        try:
+            result = selective_retrieve(
+                hash_key,
+                entry.original_content,
+                args,
+                exact_terms=exact_terms,
+                prior=prior,
+                semantic=semantic,
+                max_chars=max_chars,
+            )
+        except Exception as exc:  # noqa: BLE001 - an index failure must not lose the data
+            logger.warning(
+                "CCR selective index failed for %s (%s); serving full content", hash_key, exc
+            )
+            return {
+                "hash": hash_key,
+                "mode": "full",
+                "original_content": entry.original_content,
+                "note": "selective index unavailable; full original returned",
+                **common,
+            }
+        return {**result, **common}
 
     def get_metadata(
         self,
@@ -588,6 +656,20 @@ class CompressionStore:
             "event=headroom_retrieve %s",
             json.dumps(event, ensure_ascii=False, separators=(",", ":")),
         )
+
+    def verify_exact(self, hash_key: str, original: str) -> bool:
+        """Self-test: does ``hash_key`` hold exactly ``original``?
+
+        Used to prove a just-written entry is retrievable before any caller
+        advertises recovery for it. Unlike :meth:`retrieve` it records no
+        access and emits no retrieval event, so it never reads as a "the model
+        needed more" feedback signal.
+        """
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return False
+            return entry.original_content == original
 
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.
@@ -1086,6 +1168,48 @@ _request_ccr_store: ContextVar[CompressionStore | None] = ContextVar(
 # Global store instance (lazy initialization)
 _compression_store: CompressionStore | None = None
 _store_lock = threading.Lock()
+
+
+# Retrieval listeners (e.g. the intelligence layer's retention learner). They
+# receive payload-free metadata only — never original or compressed content —
+# and run after the store lock is released. A failing listener is ignored.
+_RETRIEVAL_LISTENERS: list[Any] = []
+_RETRIEVAL_LISTENERS_LOCK = threading.Lock()
+
+
+def add_retrieval_listener(listener: Any) -> None:
+    """Register ``listener(info: dict)`` for every successful retrieval (idempotent)."""
+    with _RETRIEVAL_LISTENERS_LOCK:
+        if listener not in _RETRIEVAL_LISTENERS:
+            _RETRIEVAL_LISTENERS.append(listener)
+
+
+def remove_retrieval_listener(listener: Any) -> None:
+    with _RETRIEVAL_LISTENERS_LOCK:
+        if listener in _RETRIEVAL_LISTENERS:
+            _RETRIEVAL_LISTENERS.remove(listener)
+
+
+def _notify_retrieval_listeners(entry: CompressionEntry, retrieval_type: str) -> None:
+    with _RETRIEVAL_LISTENERS_LOCK:
+        listeners = list(_RETRIEVAL_LISTENERS)
+    if not listeners:
+        return
+    info = {
+        "hash": entry.hash,
+        "tool_name": entry.tool_name,
+        "compression_strategy": entry.compression_strategy,
+        "tool_signature_hash": entry.tool_signature_hash,
+        "retrieval_type": retrieval_type,
+        "created_at": entry.created_at,
+        "original_tokens": entry.original_tokens,
+        "compressed_tokens": entry.compressed_tokens,
+    }
+    for listener in listeners:
+        try:
+            listener(info)
+        except Exception:  # noqa: BLE001 - observers never break retrieval
+            logger.debug("retrieval listener failed", exc_info=True)
 
 
 def set_request_compression_store(store: CompressionStore | None) -> None:

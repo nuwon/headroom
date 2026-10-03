@@ -57,6 +57,9 @@ class AgentSavingsProfile:
     code_aware: bool = True
     lossless: bool = False
     min_chars_for_block: int | None = None
+    # Context-intelligence posture seeded for this profile ("off" | "safe" |
+    # "full"); None leaves HEADROOM_INTELLIGENCE untouched.
+    intelligence: str | None = None
 
     @property
     def savings_percent(self) -> int:
@@ -95,6 +98,8 @@ class AgentSavingsProfile:
         # Block-compression char floor: only emit when the profile pins one.
         if self.min_chars_for_block is not None:
             env["HEADROOM_MIN_CHARS_FOR_BLOCK"] = str(self.min_chars_for_block)
+        if self.intelligence is not None:
+            env["HEADROOM_INTELLIGENCE"] = self.intelligence
         return env
 
     def apply_proxy_env_defaults(self, env: MutableMapping[str, str]) -> MutableMapping[str, str]:
@@ -182,6 +187,11 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         code_aware=True,
         lossless=False,
         min_chars_for_block=25,
+        # Deterministic, quality-preserving intelligence: task-aware relevance,
+        # invariant guard, policy risk budgets, arbiter, indexed CCR search,
+        # selective expansion, retention learning. Aggressive rewrites (delta,
+        # admission, catalog, budget allocator) stay opt-in via "full".
+        intelligence="safe",
     ),
     "general": AgentSavingsProfile(
         name="general",

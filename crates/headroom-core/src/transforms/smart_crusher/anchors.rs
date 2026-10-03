@@ -49,12 +49,11 @@ static HOSTNAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 static QUOTED_STRING_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"['"]([^'"]{1,50})['"]"#).expect("QUOTED_STRING_PATTERN"));
 
-/// Email addresses. Python: `r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"`.
-/// (Note Python's `[A-Z|a-z]` includes a literal `|` in the character
-/// class — almost certainly a typo, but we faithfully port it for
-/// parity. Real-world impact is nil since `|` doesn't appear in TLDs.)
+/// Email addresses. Python: `r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"`.
+/// (Both sides once spelled the TLD class `[A-Z|a-z]`, which also
+/// accepted a literal `|`; fixed together so parity holds.)
 static EMAIL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b").expect("EMAIL_PATTERN")
+    Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").expect("EMAIL_PATTERN")
 });
 
 /// Hostname false-positive blocklist. Python uses a set literal at
@@ -333,13 +332,19 @@ mod tests {
     }
 
     #[test]
-    fn email_typo_pattern_still_matches_real_emails() {
-        // S4 in code review: the Python `[A-Z|a-z]` typo doesn't break
-        // real email matching — pin that explicitly.
+    fn email_pattern_matches_real_emails() {
         let anchors = extract_query_anchors("contact alice@example.com today");
         assert!(anchors.contains("alice@example.com"));
         let anchors = extract_query_anchors("ping bob@SUB.EXAMPLE.IO");
         assert!(anchors.contains("bob@sub.example.io"));
+    }
+
+    #[test]
+    fn email_tld_class_rejects_pipe() {
+        // The TLD class used to be `[A-Z|a-z]`, which accepted `|`.
+        assert!(EMAIL_PATTERN.is_match("alice@example.com"));
+        assert!(!EMAIL_PATTERN.is_match("x@host.c|om"));
+        assert!(!EMAIL_PATTERN.is_match("x@host.||"));
     }
 
     // ---------- python_repr (used by item_matches_anchors) ----------

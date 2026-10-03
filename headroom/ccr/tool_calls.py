@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from .tool_injection import CCR_TOOL_NAME, parse_tool_call
+from .tool_injection import CCR_TOOL_NAME, parse_tool_call, parse_tool_call_args
 
 
 @dataclass
@@ -15,6 +15,9 @@ class CCRToolCall:
     tool_call_id: str
     hash_key: str
     tool_name: str | None = None
+    # Optional indexed-retrieval arguments (query/mode/top_k/cursor/range).
+    # ``None`` or ``mode == "full"`` means the historical full retrieval.
+    args: Any = field(default=None, compare=False)
 
 
 def extract_tool_calls(response: dict[str, Any], provider: str) -> list[dict[str, Any]]:
@@ -121,7 +124,12 @@ def parse_ccr_tool_calls(
             if isinstance(function_call, dict) and function_call.get("id"):
                 tool_name = str(function_call.get("name", CCR_TOOL_NAME))
         ccr_calls.append(
-            CCRToolCall(tool_call_id=tool_call_id, hash_key=hash_key, tool_name=tool_name)
+            CCRToolCall(
+                tool_call_id=tool_call_id,
+                hash_key=hash_key,
+                tool_name=tool_name,
+                args=parse_tool_call_args(tool_call, provider),
+            )
         )
 
     return ccr_calls, other_calls

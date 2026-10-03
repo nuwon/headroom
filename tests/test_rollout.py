@@ -91,10 +91,10 @@ def test_stable_blocks_explicit_canary_feature() -> None:
     snapshot = resolve_rollout(
         {
             "HEADROOM_ROLLOUT_CHANNEL": "stable",
-            "HEADROOM_FEATURES": "tool-result-interceptors",
+            "HEADROOM_FEATURES": "canary-probe",
         }
     )
-    decision = snapshot.decision("tool_result_interceptors")
+    decision = snapshot.decision("canary_probe")
 
     assert decision.enabled is False
     assert decision.reason is FeatureDecisionReason.BLOCKED_BY_CHANNEL
@@ -104,48 +104,37 @@ def test_canary_allows_explicit_request() -> None:
     snapshot = resolve_rollout(
         {
             "HEADROOM_ROLLOUT_CHANNEL": "canary",
-            "HEADROOM_FEATURES": "tool_result_interceptors",
+            "HEADROOM_FEATURES": "canary_probe",
         }
     )
 
-    assert snapshot.decision("tool_result_interceptors").reason is FeatureDecisionReason.EXPLICIT
+    assert snapshot.decision("canary_probe").reason is FeatureDecisionReason.EXPLICIT
 
 
 def test_non_default_feature_remains_off_when_not_requested() -> None:
-    decision = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "dev"}).decision(
-        "tool_result_interceptors"
-    )
+    decision = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "dev"}).decision("canary_probe")
     assert decision.enabled is False
     assert decision.reason is FeatureDecisionReason.NOT_REQUESTED
 
 
 def test_legacy_alias_obeys_channel_and_has_distinct_reason() -> None:
-    stable = resolve_rollout(
-        {"HEADROOM_ROLLOUT_CHANNEL": "stable", "HEADROOM_INTERCEPT_ENABLED": "1"}
-    )
-    canary = resolve_rollout(
-        {"HEADROOM_ROLLOUT_CHANNEL": "canary", "HEADROOM_INTERCEPT_ENABLED": "1"}
-    )
+    stable = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "stable", "HEADROOM_CANARY_PROBE": "1"})
+    canary = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "canary", "HEADROOM_CANARY_PROBE": "1"})
 
-    assert (
-        stable.decision("tool_result_interceptors").reason
-        is FeatureDecisionReason.BLOCKED_BY_CHANNEL
-    )
-    assert canary.decision("tool_result_interceptors").reason is FeatureDecisionReason.LEGACY_ALIAS
+    assert stable.decision("canary_probe").reason is FeatureDecisionReason.BLOCKED_BY_CHANNEL
+    assert canary.decision("canary_probe").reason is FeatureDecisionReason.LEGACY_ALIAS
 
 
-@pytest.mark.parametrize("request_source", ["HEADROOM_FEATURES", "HEADROOM_INTERCEPT_ENABLED"])
+@pytest.mark.parametrize("request_source", ["HEADROOM_FEATURES", "HEADROOM_CANARY_PROBE"])
 def test_disable_beats_explicit_and_legacy_request(request_source: str) -> None:
     snapshot = resolve_rollout(
         {
             "HEADROOM_ROLLOUT_CHANNEL": "canary",
-            request_source: "tool_result_interceptors"
-            if request_source.endswith("FEATURES")
-            else "1",
-            "HEADROOM_DISABLE_FEATURES": "tool_result_interceptors",
+            request_source: "canary_probe" if request_source.endswith("FEATURES") else "1",
+            "HEADROOM_DISABLE_FEATURES": "canary_probe",
         }
     )
-    decision = snapshot.decision("tool_result_interceptors")
+    decision = snapshot.decision("canary_probe")
 
     assert decision.enabled is False
     assert decision.reason is FeatureDecisionReason.DISABLED
@@ -155,16 +144,13 @@ def test_unsafe_override_crosses_channel_and_poisons_qualification() -> None:
     snapshot = resolve_rollout(
         {
             "HEADROOM_ROLLOUT_CHANNEL": "stable",
-            "HEADROOM_FEATURES": "tool_result_interceptors",
+            "HEADROOM_FEATURES": "canary_probe",
             "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES": "1",
         }
     )
     payload = snapshot.to_dict()
 
-    assert (
-        snapshot.decision("tool_result_interceptors").reason
-        is FeatureDecisionReason.UNSAFE_OVERRIDE
-    )
+    assert snapshot.decision("canary_probe").reason is FeatureDecisionReason.UNSAFE_OVERRIDE
     assert payload["qualification_eligible"] is False
     assert payload["qualification_ineligible_reason"] == "unsafe_rollout_override_active"
 
@@ -172,12 +158,12 @@ def test_unsafe_override_crosses_channel_and_poisons_qualification() -> None:
 def test_disable_still_beats_unsafe_override() -> None:
     snapshot = resolve_rollout(
         {
-            "HEADROOM_FEATURES": "tool_result_interceptors",
-            "HEADROOM_DISABLE_FEATURES": "tool_result_interceptors",
+            "HEADROOM_FEATURES": "canary_probe",
+            "HEADROOM_DISABLE_FEATURES": "canary_probe",
             "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES": "1",
         }
     )
-    assert snapshot.decision("tool_result_interceptors").reason is FeatureDecisionReason.DISABLED
+    assert snapshot.decision("canary_probe").reason is FeatureDecisionReason.DISABLED
 
 
 def test_live_legacy_reresolution_preserves_channel_and_named_kill_switch() -> None:
@@ -327,20 +313,20 @@ def test_snapshot_query_and_compatibility_helpers() -> None:
     snapshot = current_rollout(
         {
             "HEADROOM_ROLLOUT_CHANNEL": "canary",
-            "HEADROOM_FEATURES": "tool_result_interceptors",
+            "HEADROOM_FEATURES": "canary_probe",
             "HEADROOM_DISABLE_FEATURES": "read_maturation",
         }
     )
 
-    assert snapshot.is_available("tool-result-interceptors") is True
-    assert snapshot.enabled == frozenset({"tool_result_interceptors"})
+    assert snapshot.is_available("canary-probe") is True
+    assert snapshot.enabled == frozenset({"canary_probe"})
     assert snapshot.disabled == frozenset({"read_maturation"})
     assert feature_enabled(
-        "tool_result_interceptors",
+        "canary_probe",
         explicit=True,
         environ={"HEADROOM_ROLLOUT_CHANNEL": "canary"},
     )
-    assert not feature_enabled("tool_result_interceptors", environ={})
+    assert not feature_enabled("canary_probe", environ={})
     with pytest.raises(KeyError, match="missing"):
         snapshot.decision("missing")
 
@@ -350,9 +336,7 @@ def test_registry_and_snapshot_digests_are_deterministic_and_policy_sensitive() 
     second = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "canary"})
     equivalent = dict(reversed(list(FEATURES.items())))
     changed = dict(FEATURES)
-    changed["tool_result_interceptors"] = FeatureSpec(
-        "tool_result_interceptors", RolloutChannel.BETA
-    )
+    changed["canary_probe"] = FeatureSpec("canary_probe", RolloutChannel.BETA)
 
     assert first.registry_digest == second.registry_digest == registry_digest(equivalent)
     assert first.snapshot_digest == second.snapshot_digest
@@ -392,7 +376,7 @@ def test_cli_json_status_and_strict_error() -> None:
             "--channel",
             "canary",
             "--features",
-            "tool_result_interceptors",
+            "canary_probe",
             "--json",
         ],
     )
@@ -401,7 +385,7 @@ def test_cli_json_status_and_strict_error() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["channel"] == "canary"
-    assert "tool_result_interceptors" in [feature["name"] for feature in payload["features"]]
+    assert "canary_probe" in [feature["name"] for feature in payload["features"]]
     assert invalid.exit_code != 0
     assert "unknown rollout feature" in invalid.output
 
@@ -415,7 +399,7 @@ def test_cli_human_status_exercises_disable_and_unsafe_options() -> None:
             "--channel",
             "stable",
             "--features",
-            "tool_result_interceptors",
+            "canary_probe",
             "--disable-features",
             "read_maturation",
             "--unsafe-allow-unstable-features",
@@ -425,7 +409,7 @@ def test_cli_human_status_exercises_disable_and_unsafe_options() -> None:
     assert result.exit_code == 0
     assert "Rollout channel: stable" in result.output
     assert "Qualification eligible: false" in result.output
-    assert "tool_result_interceptors: enabled=true decision=unsafe_override" in result.output
+    assert "canary_probe: enabled=true decision=unsafe_override" in result.output
     assert "read_maturation: enabled=false decision=disabled" in result.output
 
 
@@ -433,11 +417,6 @@ def test_cli_human_status_exercises_disable_and_unsafe_options() -> None:
     ("option", "message", "required_channel"),
     [
         ("--read-maturation", "--read-maturation is not available", "beta"),
-        (
-            "--intercept-tool-results",
-            "--intercept-tool-results is not available",
-            "canary",
-        ),
     ],
 )
 def test_proxy_cli_fails_loudly_when_explicit_feature_is_channel_blocked(
@@ -461,11 +440,35 @@ def test_shared_python_rust_policy_vectors() -> None:
     for vector in vectors:
         env = {"HEADROOM_ROLLOUT_CHANNEL": vector["channel"]}
         if vector["requested"]:
-            env["HEADROOM_FEATURES"] = "tool_result_interceptors"
+            env["HEADROOM_FEATURES"] = "canary_probe"
         if vector["disabled"]:
-            env["HEADROOM_DISABLE_FEATURES"] = "tool_result_interceptors"
+            env["HEADROOM_DISABLE_FEATURES"] = "canary_probe"
         if vector["unsafe"]:
             env["HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES"] = "1"
-        decision = resolve_rollout(env).decision("tool_result_interceptors")
+        decision = resolve_rollout(env).decision("canary_probe")
         assert decision.enabled is vector["enabled"]
         assert decision.reason.value == vector["decision"]
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"HEADROOM_INTERCEPT_ENABLED": "1"},
+        {"HEADROOM_FEATURES": "tool_result_interceptors"},
+        {"HEADROOM_ROLLOUT_CHANNEL": "stable", "HEADROOM_FEATURES": "tool-result-interceptors"},
+    ],
+)
+def test_tool_result_interceptors_enable_on_stable_channel(env: dict[str, str]) -> None:
+    """Interceptors are opt-in but need no channel switch or unsafe override."""
+    snapshot = resolve_rollout(env)
+    decision = snapshot.decision("tool_result_interceptors")
+    assert decision.enabled is True
+    assert decision.reason in (FeatureDecisionReason.EXPLICIT, FeatureDecisionReason.LEGACY_ALIAS)
+    assert snapshot.qualification_eligible is True
+
+
+def test_tool_result_interceptors_off_by_default_and_cli_request_enables() -> None:
+    assert resolve_rollout({}).is_enabled("tool_result_interceptors") is False
+    assert resolve_rollout({}, requested=["tool_result_interceptors"]).is_enabled(
+        "tool_result_interceptors"
+    )

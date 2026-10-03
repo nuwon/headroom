@@ -340,8 +340,42 @@ def dashboard(port: int, no_open: bool) -> None:
     is_flag=True,
     help=(
         "Opt in to tool_result interceptors (ast-grep Read outliner, etc.). "
-        "Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev)."
+        "Available on the stable channel. Env: HEADROOM_INTERCEPT_ENABLED=1."
     ),
+)
+@click.option(
+    "--intelligence",
+    "intelligence_level",
+    type=click.Choice(["off", "safe", "full"], case_sensitive=False),
+    default=None,
+    help=(
+        "Context-intelligence posture: off | safe (task-aware relevance, invariant "
+        "guard, policy risk budgets, arbiter, indexed CCR search, retention "
+        "learning) | full (safe + delta encoding, pre-context admission, budget "
+        "allocator, progressive tool catalog, rich interceptors). Per-feature env "
+        "vars override (see `headroom intelligence status`). Env: HEADROOM_INTELLIGENCE."
+    ),
+)
+@click.option(
+    "--jevk5",
+    "jevk5_mode",
+    type=click.Choice(["auto", "on", "off"], case_sensitive=False),
+    default=None,
+    help=(
+        "Local JevK5 decision advisor via llama.cpp: auto (use when set up; default) | "
+        "on (set up/download/build as needed) | off. Env: HEADROOM_JEVK5."
+    ),
+)
+@click.option(
+    "--jevk5-url",
+    default=None,
+    help="Operator-managed /v1/systemone decision endpoint (never started/stopped by Headroom). Env: HEADROOM_JEVK5_URL.",
+)
+@click.option(
+    "--llama-server",
+    "llama_server_path",
+    default=None,
+    help="Path to an existing llama-server executable. Env: HEADROOM_JEVK5_LLAMA_SERVER.",
 )
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
@@ -1047,6 +1081,10 @@ def proxy(
     http2: bool,
     http_proxy: str | None,
     intercept_tool_results: bool,
+    intelligence_level: str | None,
+    jevk5_mode: str | None,
+    jevk5_url: str | None,
+    llama_server_path: str | None,
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
@@ -1188,10 +1226,24 @@ def proxy(
     # Resolve rollout inputs once before constructing any rollout-managed
     # behavior. The immutable snapshot is injected into ProxyConfig and is also
     # what /stats later exposes.
+    from headroom.intelligence.config import IntelligenceConfig
     from headroom.rollout import resolve_rollout
 
+    # CLI flags override the matching env vars; everything else comes from env.
+    _intel_env = dict(os.environ)
+    for _flag_value, _env_name in (
+        (intelligence_level, "HEADROOM_INTELLIGENCE"),
+        (jevk5_mode, "HEADROOM_JEVK5"),
+        (jevk5_url, "HEADROOM_JEVK5_URL"),
+        (llama_server_path, "HEADROOM_JEVK5_LLAMA_SERVER"),
+    ):
+        if _flag_value:
+            _intel_env[_env_name] = _flag_value
+            os.environ[_env_name] = _flag_value  # workers / MCP probe see the same posture
+    intelligence_config = IntelligenceConfig.from_env(_intel_env)
+
     rollout_requests = []
-    if intercept_tool_results:
+    if intercept_tool_results or intelligence_config.rich_interceptors:
         rollout_requests.append("tool_result_interceptors")
     if read_maturation:
         rollout_requests.append("read_maturation")
@@ -1332,6 +1384,7 @@ def proxy(
         host=host,
         port=port,
         rollout=rollout_snapshot,
+        intelligence=intelligence_config,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
         openai_extra_headers=resolved_openai_extra_headers,

@@ -810,6 +810,7 @@ def _shape_openai_responses_payload(
     must not be able to break request forwarding.
     """
     try:
+        from headroom.intelligence.turn_routing import adjust_verbosity, route_effort
         from headroom.proxy import runtime_env
         from headroom.proxy.output_savings import (
             assign_arm,
@@ -825,9 +826,15 @@ def _shape_openai_responses_payload(
             shape_responses_request,
         )
 
+        # Complexity-aware effort routing (HEADROOM_EFFORT_ROUTING=1 only);
+        # independent of the shaper, so it runs before the enabled check.
+        effort_labels = route_effort(
+            payload, "openai_responses", conversation_key_from_responses_body(payload)
+        )
+
         settings = OutputShaperSettings.from_env(enabled=output_shaper_enabled)
         if not settings.enabled:
-            return [], False
+            return effort_labels, bool(effort_labels)
 
         try:
             holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
@@ -846,12 +853,14 @@ def _shape_openai_responses_payload(
         )
         # The conversation is the unit the arm was assigned to, so the ledger
         # needs it to count distinct conversations rather than requests.
-        labels = [stratum_label(arm, stratum), conversation_label(conversation)]
+        labels = [stratum_label(arm, stratum), conversation_label(conversation), *effort_labels]
 
         if arm != "treatment":
-            return labels, False
+            return labels, bool(effort_labels)
 
         level, src = resolve_verbosity_level(settings)
+        level, verbosity_labels = adjust_verbosity(payload, "openai_responses", level)
+        labels.extend(verbosity_labels)
         shape_result = shape_responses_request(payload, settings, level_override=level)
         if shape_result.changed:
             labels.extend(shape_result.labels or [])
@@ -862,7 +871,7 @@ def _shape_openai_responses_payload(
                 src,
                 shape_result.labels,
             )
-        return labels, shape_result.changed
+        return labels, shape_result.changed or bool(effort_labels)
     except Exception:  # pragma: no cover - defensive; never break forwarding
         logger.warning("[%s] OutputShaper(responses) failed; skipping", request_id, exc_info=True)
         return [], False
@@ -1538,6 +1547,7 @@ def _shape_openai_responses_for_output(
     output_shaper_enabled: bool | None = None,
 ) -> Any:
     """Apply OpenAI Responses output shaping and attach holdout labels."""
+    from headroom.intelligence.turn_routing import adjust_verbosity, route_effort
     from headroom.proxy.output_savings import (
         assign_arm,
         conversation_key_from_body,
@@ -1554,11 +1564,17 @@ def _shape_openai_responses_for_output(
 
     settings = OutputShaperSettings.from_env(enabled=output_shaper_enabled)
     result = ShapeResult()
+    assert result.labels is not None
+    key = conversation_key or conversation_key_from_body(payload)
+    # Complexity-aware effort routing (HEADROOM_EFFORT_ROUTING=1 only);
+    # independent of the shaper.
+    effort_labels = route_effort(payload, "openai_responses", key)
+    if effort_labels:
+        result.changed = True
+        result.labels.extend(effort_labels)
     if not settings.enabled:
         return result
 
-    assert result.labels is not None
-    key = conversation_key or conversation_key_from_body(payload)
     arm = assign_arm(key, _output_shaping_holdout_fraction())
     turn_kind = classify_openai_responses_input(payload.get("input")).value
     stratum = stratum_key(
@@ -1572,12 +1588,14 @@ def _shape_openai_responses_for_output(
         return result
 
     level, _source = resolve_verbosity_level(settings)
+    level, verbosity_labels = adjust_verbosity(payload, "openai_responses", level)
     shaped = shape_openai_responses_request(
         payload,
         settings=settings,
         level_override=level,
     )
-    shaped.labels = [*result.labels, *(shaped.labels or [])]
+    shaped.labels = [*result.labels, *verbosity_labels, *(shaped.labels or [])]
+    shaped.changed = shaped.changed or bool(effort_labels)
     return shaped
 
 
@@ -2110,6 +2128,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         pass_id: str | None = None,
         timing: dict[str, float] | None = None,
+        intel_turn: Any = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -2643,6 +2662,27 @@ class OpenAIHandlerMixin:
                 if item_type == "message"
                 else self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
             )
+            # Intelligence (opt-in): task query, learned bias and the review's
+            # TaskContext, pinned per item text on first sighting so every
+            # later turn routes this text identically (cache-stable).
+            intel_kwargs: dict[str, Any] = {}
+            intel = getattr(self, "_responses_intel", None)
+            if (
+                intel_turn is not None
+                and intel is not None
+                and len(original_text.encode("utf-8", errors="replace")) >= min_bytes
+            ):
+                call_id = item.get("call_id") if isinstance(item, dict) else None
+                unit_tool = (
+                    function_name_by_call_id.get(call_id, "") if isinstance(call_id, str) else ""
+                )
+                pin = intel.pin_for(original_text, tool_name=unit_tool, turn=intel_turn)
+                intel_kwargs = {
+                    "context": pin.context,
+                    "bias": pin.bias,
+                    "intel_task": pin.task,
+                    "tool_name": unit_tool,
+                }
             unit = CompressionUnit(
                 text=original_text,
                 provider="openai",
@@ -2653,6 +2693,7 @@ class OpenAIHandlerMixin:
                 mutable=True,
                 min_bytes=min_bytes,
                 metadata=metadata,
+                **intel_kwargs,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -2991,6 +3032,81 @@ class OpenAIHandlerMixin:
             attempted_input_tokens,
         )
 
+    def _openai_responses_intelligence(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str,
+        request_id: str,
+    ) -> tuple[Any, dict[str, Any] | None, int, list[str]] | None:
+        """Intelligence layer for a Responses payload (Codex); fail-open.
+
+        Returns ``(turn, rewritten_payload_or_None, tokens_saved, tags)`` or
+        None when the layer is off. The turn carries the TaskContext/query the
+        unit router pins per item text; the rewritten payload carries delta /
+        admission rewrites of tool outputs (decisions pinned by the prep
+        transform's memo).
+        """
+        runtime = getattr(self, "intelligence", None)
+        if runtime is None:
+            return None
+        try:
+            if not runtime.config.any_enabled:
+                return None
+            items_key = (
+                "input"
+                if isinstance(payload.get("input"), list)
+                else ("messages" if isinstance(payload.get("messages"), list) else None)
+            )
+            if items_key is None:
+                return None
+            intel = getattr(self, "_responses_intel", None)
+            if intel is None:
+                from headroom.intelligence.responses import ResponsesIntelligence
+
+                intel = ResponsesIntelligence(runtime)
+                self._responses_intel = intel
+            items = payload[items_key]
+            turn = intel.begin(items, model=model, request_id=request_id)
+            if turn is None:
+                return None
+            prep = None
+            pipeline = getattr(self, "openai_pipeline", None)
+            for transform in getattr(pipeline, "transforms", None) or []:
+                if getattr(transform, "name", "") == "intelligence_prep":
+                    prep = transform
+                    break
+            if prep is None:
+                return turn, None, 0, []
+            from headroom.tokenizer import Tokenizer
+            from headroom.transforms.compression_units import find_content_router
+
+            router = find_content_router(pipeline)
+            markers_ok = bool(
+                router is not None
+                and getattr(router.config, "ccr_inject_marker", False)
+                and not getattr(router.config, "lossless", False)
+            )
+            counter = self.openai_provider.get_token_counter(model)
+            new_items = intel.apply_prep(
+                prep, items, turn, Tokenizer(counter, model), markers_ok=markers_ok
+            )
+            if new_items is None:
+                return turn, None, 0, []
+            saved = 0
+            for old_item, new_item in zip(items, new_items):
+                if old_item is not new_item:
+                    saved += max(
+                        0,
+                        counter.count_text(_json_debug_dumps(old_item))
+                        - counter.count_text(_json_debug_dumps(new_item)),
+                    )
+            tags = [f"openai:responses:{tag}" for tag in dict.fromkeys(turn.prep_tags)]
+            return turn, {**payload, items_key: new_items}, saved, tags
+        except Exception:  # noqa: BLE001 - intelligence never breaks a request
+            logger.debug("[%s] Responses intelligence skipped", request_id, exc_info=True)
+            return None
+
     def _compress_openai_responses_payload(
         self,
         payload: dict[str, Any],
@@ -3171,6 +3287,25 @@ class OpenAIHandlerMixin:
             except Exception:
                 logger.debug("tool-search savings attribution skipped", exc_info=True)
 
+        # Progressive tool catalog (HEADROOM_TOOL_CATALOG, "full" posture) when
+        # native tool search did not apply (older models, small clients). This
+        # path has no prefix tracker, so the per-conversation set is chosen once
+        # and never reshuffled (cache_cold=False): later-used tools stay callable
+        # in their compact form instead of rewriting the cached tools prefix.
+        if working.get("tools"):
+            from headroom.intelligence.turn_routing import apply_tool_catalog
+
+            _catalog_body = {"tools": working.get("tools"), "input": working.get("input")}
+            _catalog_labels = apply_tool_catalog(
+                _catalog_body, "openai_responses", cache_cold=False
+            )
+            if _catalog_labels:
+                if working is payload:
+                    working = copy.deepcopy(payload)
+                working["tools"] = _catalog_body["tools"]
+                modified = True
+                transforms.extend(f"openai:responses:{label}" for label in _catalog_labels)
+
         # Turn hooks (opt-in extensions): a registered hook may inspect or rewrite
         # the outbound tools before we send — the extensible counterpart to the
         # built-in deferral above. Gated on the registry so it is a no-op (no copy,
@@ -3252,6 +3387,20 @@ class OpenAIHandlerMixin:
             modified = True
             transforms.append("openai:responses:turn_hook")
 
+        intel_turn = None
+        intel_started = time.perf_counter()
+        intel_result = self._openai_responses_intelligence(
+            working, model=model, request_id=request_id
+        )
+        if intel_result is not None:
+            intel_turn, intel_payload, intel_saved, intel_tags = intel_result
+            if intel_payload is not None:
+                working = intel_payload
+                modified = True
+                tokens_saved += intel_saved
+                transforms.extend(intel_tags)
+        _add_timing("compression_intelligence", intel_started)
+
         live_units_started = time.perf_counter()
         (
             router_payload,
@@ -3267,6 +3416,7 @@ class OpenAIHandlerMixin:
             request_id=request_id,
             pass_id=pass_id,
             timing=timing_sink,
+            intel_turn=intel_turn,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -4357,6 +4507,18 @@ class OpenAIHandlerMixin:
             except Exception as e:
                 logger.debug(f"[{request_id}] post_compress hook error: {e}")
 
+        # Progressive tool catalog (HEADROOM_TOOL_CATALOG, "full" posture):
+        # chat completions has no native deferral. Sticky per conversation;
+        # the materialized set grows only on a cold prefix cache.
+        if not _bypass and body.get("tools"):
+            from headroom.intelligence.turn_routing import apply_tool_catalog
+
+            transforms_applied.extend(
+                apply_tool_catalog(
+                    body, "openai_chat", cache_cold=int(openai_frozen_count or 0) == 0
+                )
+            )
+
         # CCR Tool Injection: Inject retrieval tool if compression occurred
         # OR if this session has previously done CCR (PR-B7 sticky-on).
         # See `headroom/proxy/handlers/anthropic.py` and PR-B7 plan
@@ -4846,6 +5008,7 @@ class OpenAIHandlerMixin:
         # Mutating `body` in place is sufficient here — the outbound request
         # serializes `body` fresh, so no body-mutation tracker is needed.
         if not _bypass:
+            from headroom.intelligence.turn_routing import adjust_verbosity, route_effort
             from headroom.proxy import runtime_env
             from headroom.proxy.output_savings import (
                 assign_arm,
@@ -4859,6 +5022,11 @@ class OpenAIHandlerMixin:
                 classify_turn,
                 resolve_verbosity_level,
                 shape_openai_chat_request,
+            )
+
+            # Complexity-aware effort routing (HEADROOM_EFFORT_ROUTING=1 only).
+            transforms_applied.extend(
+                route_effort(body, "openai_chat", conversation_key_from_body(body))
             )
 
             _shaper_settings = OutputShaperSettings.from_env(
@@ -4891,6 +5059,8 @@ class OpenAIHandlerMixin:
                 transforms_applied.append(conversation_label(_conversation))
                 if _arm == "treatment":
                     _level, _src = resolve_verbosity_level(_shaper_settings)
+                    _level, _verbosity_labels = adjust_verbosity(body, "openai_chat", _level)
+                    transforms_applied.extend(_verbosity_labels)
                     _shape_result = shape_openai_chat_request(
                         body, _shaper_settings, level_override=_level
                     )

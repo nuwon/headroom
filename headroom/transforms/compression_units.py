@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from typing import Protocol
+from typing import Any, Protocol
 
 from .content_router import (
     CompressionStrategy,
@@ -40,6 +40,11 @@ class CompressionUnit:
     bias: float = 1.0
     min_bytes: int = 512
     metadata: dict[str, str] = field(default_factory=dict)
+    # Intelligence layer (opt-in): the pinned TaskContext and producing tool
+    # for the invariant guard / Transform Arbiter review. Excluded from
+    # equality; provider unit caches key on ``context``/``bias``/``metadata``.
+    intel_task: Any = field(default=None, compare=False, repr=False)
+    tool_name: str = field(default="", compare=False)
 
 
 # Categorical buckets for unit-level outcomes. Lets log readers filter
@@ -320,6 +325,15 @@ def compress_unit_with_router(
     finally:
         if target_ratio is not None:
             router._runtime_target_ratio = prior_target_ratio
+    if unit.intel_task is not None:
+        router_result = router._intelligence_review(
+            unit.text,
+            router_result,
+            context=unit.context,
+            bias=unit.bias,
+            tool_name=unit.tool_name,
+            task=unit.intel_task,
+        )
     replacement = router_result.compressed
     strategy = router_result.strategy_used.value
     if replacement == unit.text:

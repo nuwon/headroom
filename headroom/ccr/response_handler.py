@@ -217,7 +217,21 @@ class CCRResponseHandler:
                     tool_name=ccr_call.tool_name,
                 )
 
-            # Retrieval is by hash: always return the full original content.
+            # Indexed/partial retrieval: a call carrying query/mode/range is
+            # answered from the span index (exact span slices); everything
+            # else keeps the historical full-original behavior.
+            args = getattr(ccr_call, "args", None)
+            if args is not None and getattr(args, "selective", False):
+                result = store.retrieve_selective(ccr_call.hash_key, args)
+                if result is not None:
+                    return CCRToolResult(
+                        tool_call_id=ccr_call.tool_call_id,
+                        content=json.dumps(result, indent=2, ensure_ascii=False),
+                        success=True,
+                        items_retrieved=len(result.get("spans", ()))
+                        or result.get("original_item_count", 0),
+                        tool_name=ccr_call.tool_name,
+                    )
             entry = store.retrieve(ccr_call.hash_key)
             if entry:
                 content = json.dumps(

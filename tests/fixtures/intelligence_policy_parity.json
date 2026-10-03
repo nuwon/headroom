@@ -1,0 +1,646 @@
+{
+ "_comment": "Shared Python/Rust parity cases for headroom/intelligence/policy.py and crates/headroom-core/src/compression_policy.rs. Regenerate from the Python reference only when the semantics change on BOTH sides.",
+ "admission": [
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 1000,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 1200,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 600,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.4,
+   "irreversible_drop_ratio": 0.4
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 550,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.45,
+   "irreversible_drop_ratio": 0.45
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 549,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.451,
+   "irreversible_drop_ratio": 0.451
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 750,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.25,
+   "irreversible_drop_ratio": 0.25
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 749,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.251,
+   "irreversible_drop_ratio": 0.251
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": false,
+   "allowed": false,
+   "reason": "invalid_marker",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.9
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": false,
+   "lossless": true,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": true,
+   "marker_valid": false,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 0,
+   "candidate_tokens": 0,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 3,
+   "candidate_tokens": 1,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.666667,
+   "irreversible_drop_ratio": 0.666667
+  },
+  {
+   "policy": "payg",
+   "original_tokens": 7919,
+   "candidate_tokens": 4000,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.494886,
+   "irreversible_drop_ratio": 0.494886
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 1000,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 1200,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 600,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.4,
+   "irreversible_drop_ratio": 0.4
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 550,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.45,
+   "irreversible_drop_ratio": 0.45
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 549,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.451,
+   "irreversible_drop_ratio": 0.451
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 750,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.25,
+   "irreversible_drop_ratio": 0.25
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 749,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.251,
+   "irreversible_drop_ratio": 0.251
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": false,
+   "allowed": false,
+   "reason": "invalid_marker",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.9
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": false,
+   "lossless": true,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": true,
+   "marker_valid": false,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 0,
+   "candidate_tokens": 0,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 3,
+   "candidate_tokens": 1,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.666667,
+   "irreversible_drop_ratio": 0.666667
+  },
+  {
+   "policy": "subscription",
+   "original_tokens": 7919,
+   "candidate_tokens": 4000,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.494886,
+   "irreversible_drop_ratio": 0.494886
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 1000,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 1200,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 600,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.4,
+   "irreversible_drop_ratio": 0.4
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 550,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.45,
+   "irreversible_drop_ratio": 0.45
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 549,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.451,
+   "irreversible_drop_ratio": 0.451
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 750,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.25,
+   "irreversible_drop_ratio": 0.25
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 749,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.251,
+   "irreversible_drop_ratio": 0.251
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": false,
+   "marker_valid": false,
+   "allowed": false,
+   "reason": "invalid_marker",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.9
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": false,
+   "lossless": true,
+   "marker_valid": true,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "none",
+   "original_tokens": 1000,
+   "candidate_tokens": 100,
+   "recoverable": true,
+   "lossless": true,
+   "marker_valid": false,
+   "allowed": true,
+   "reason": "ok",
+   "wire_drop_ratio": 0.9,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "none",
+   "original_tokens": 0,
+   "candidate_tokens": 0,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "non_positive_savings",
+   "wire_drop_ratio": 0.0,
+   "irreversible_drop_ratio": 0.0
+  },
+  {
+   "policy": "none",
+   "original_tokens": 3,
+   "candidate_tokens": 1,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.666667,
+   "irreversible_drop_ratio": 0.666667
+  },
+  {
+   "policy": "none",
+   "original_tokens": 7919,
+   "candidate_tokens": 4000,
+   "recoverable": false,
+   "lossless": false,
+   "marker_valid": true,
+   "allowed": false,
+   "reason": "max_lossy_ratio",
+   "wire_drop_ratio": 0.494886,
+   "irreversible_drop_ratio": 0.494886
+  }
+ ],
+ "classify_change": [
+  {
+   "policy": "payg",
+   "changed_tokens": 0,
+   "class": "stable"
+  },
+  {
+   "policy": "payg",
+   "changed_tokens": 1,
+   "class": "stable"
+  },
+  {
+   "policy": "payg",
+   "changed_tokens": 31,
+   "class": "stable"
+  },
+  {
+   "policy": "payg",
+   "changed_tokens": 32,
+   "class": "stable"
+  },
+  {
+   "policy": "payg",
+   "changed_tokens": 33,
+   "class": "stable"
+  },
+  {
+   "policy": "payg",
+   "changed_tokens": 127,
+   "class": "stable"
+  },
+  {
+   "policy": "payg",
+   "changed_tokens": 128,
+   "class": "stable"
+  },
+  {
+   "policy": "payg",
+   "changed_tokens": 129,
+   "class": "volatile"
+  },
+  {
+   "policy": "payg",
+   "changed_tokens": 5000,
+   "class": "volatile"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 0,
+   "class": "stable"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 1,
+   "class": "stable"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 31,
+   "class": "stable"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 32,
+   "class": "stable"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 33,
+   "class": "volatile"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 127,
+   "class": "volatile"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 128,
+   "class": "volatile"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 129,
+   "class": "volatile"
+  },
+  {
+   "policy": "subscription",
+   "changed_tokens": 5000,
+   "class": "volatile"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 0,
+   "class": "stable"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 1,
+   "class": "stable"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 31,
+   "class": "stable"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 32,
+   "class": "stable"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 33,
+   "class": "stable"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 127,
+   "class": "stable"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 128,
+   "class": "stable"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 129,
+   "class": "volatile"
+  },
+  {
+   "policy": "none",
+   "changed_tokens": 5000,
+   "class": "volatile"
+  }
+ ]
+}

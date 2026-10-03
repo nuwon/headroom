@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -88,6 +89,36 @@ _PATTERNS: dict[str, list[str]] = {
 
 OUTLINE_MARKER = "    # ... (body elided by Headroom; Read a specific line range to see it)\n"
 
+# Rich interception (Optimization 14, HEADROOM_RICH_INTERCEPTORS=1): store the
+# exact original in CCR (verified) and carry a retrieval marker in the outline
+# header. Installed once at the proxy's composition root.
+_RICH = False
+
+
+def set_rich_mode(enabled: bool) -> None:
+    global _RICH
+    _RICH = bool(enabled)
+
+
+# Claude Code's Read returns `cat -n`-style numbered lines ("    12\tcode" or
+# "    12→code"); Codex/Cursor reads may too. Parse the source without the
+# prefixes, but emit the numbered lines so the outline keeps real line numbers.
+_NUMBERED_LINE_RE = re.compile(r"^\s*\d+(?:\t|→)")
+_TRAILING_REMINDER_RE = re.compile(r"\n*(<system-reminder>.*?</system-reminder>\s*)+$", re.S)
+
+
+def _split_numbered(output: str) -> tuple[str, list[str]] | None:
+    """``(source_without_prefixes, original_lines)`` for numbered output, else None."""
+    lines = output.splitlines(keepends=True)
+    nonblank = [ln for ln in lines if ln.strip()]
+    if not nonblank:
+        return None
+    hits = sum(1 for ln in nonblank if _NUMBERED_LINE_RE.match(ln))
+    if hits < max(3, int(0.8 * len(nonblank))):
+        return None
+    source = "".join(_NUMBERED_LINE_RE.sub("", ln, count=1) for ln in lines)
+    return source, lines
+
 
 class AstGrepReadOutline:
     """Interceptor that outlines verbose code-file Read outputs."""
@@ -127,12 +158,45 @@ class AstGrepReadOutline:
             logger.debug("ast-grep unavailable: %s", e)
             return None
 
-        matches = _run_ast_grep(exe, lang, tool_output)
+        # Harness reminders appended to the Read (Claude Code) are kept verbatim.
+        tail_match = _TRAILING_REMINDER_RE.search(tool_output)
+        body = tool_output[: tail_match.start()] if tail_match else tool_output
+        tail = tail_match.group(0).lstrip("\n") if tail_match else ""
+
+        numbered = _split_numbered(body)
+        source, display_lines = numbered if numbered else (body, None)
+        matches = _run_ast_grep(exe, lang, source)
         if not matches:
             return None
 
-        outline = _build_outline(matches, tool_output)
-        return outline if outline else None
+        outline = _build_outline(matches, source, display_lines=display_lines)
+        if not outline:
+            return None
+
+        from headroom.intelligence.task_context import detect_provenance
+
+        provenance = detect_provenance(tool_output, tool_name or "", tool_input)
+        notes: list[str] = []
+        if provenance.is_partial:
+            notes.append(
+                "[headroom: partial input — this Read returned only part of the file; the outline "
+                "lists definitions in the returned portion only"
+                + (
+                    f". Notice: {provenance.truncation_boundary}"
+                    if provenance.truncation_boundary
+                    else ""
+                )
+                + "]\n"
+            )
+        if _RICH:
+            marker = _store_original(tool_output, outline, tool_input)
+            if marker is None:
+                return None  # cannot prove recovery: keep the exact original
+            notes.append(marker)
+        result = "".join(notes) + outline
+        if tail:
+            result = result.rstrip("\n") + "\n" + tail
+        return result
 
     def progressive_disclosure_key(
         self,
@@ -258,14 +322,48 @@ def _run_ast_grep(
     return all_matches
 
 
-def _build_outline(matches: list[dict[str, Any]], source: str) -> str | None:
+def _store_original(original: str, outline: str, tool_input: dict[str, Any]) -> str | None:
+    """Store the exact Read output in CCR and return a verified marker line."""
+    try:
+        from headroom.cache.compression_store import get_compression_store
+
+        store = get_compression_store()
+        h = store.store(
+            original,
+            outline,
+            tool_name="Read",
+            compression_strategy="ast_grep_outline",
+            query_context=_path_from_input(tool_input),
+        )
+        if not store.verify_exact(h, original):
+            return None
+    except Exception as e:  # noqa: BLE001 - storage failure => no rewrite
+        logger.debug("ast-grep outline: CCR store failed: %s", e)
+        return None
+    return (
+        f"[headroom: exact original Read output stored. Retrieve original: hash={h} "
+        "(or Read a specific line range)]\n"
+    )
+
+
+def _build_outline(
+    matches: list[dict[str, Any]],
+    source: str,
+    *,
+    display_lines: list[str] | None = None,
+) -> str | None:
     """Build a compact outline from ast-grep matches.
 
     Emits each definition's signature line + docstring (if next line is a
     string literal) + an elision marker. Matches are sorted by byte offset
-    so the outline tracks the original file order.
+    so the outline tracks the original file order. When ``display_lines`` is
+    given (line-numbered Read output), the emitted lines are the numbered
+    originals at the same indices, so the outline shows real line numbers.
     """
     lines = source.splitlines(keepends=True)
+    shown = (
+        display_lines if display_lines is not None and len(display_lines) == len(lines) else lines
+    )
     outline_chunks: list[str] = []
     seen_starts: set[int] = set()
 
@@ -278,7 +376,7 @@ def _build_outline(matches: list[dict[str, Any]], source: str) -> str | None:
         seen_starts.add(line_idx)
         if line_idx >= len(lines):
             continue
-        signature_line = lines[line_idx].rstrip("\n")
+        signature_line = shown[line_idx].rstrip("\n")
         outline_chunks.append(signature_line + "\n")
         # Best-effort: if the next non-blank line is a docstring, keep it.
         next_idx = line_idx + 1
@@ -287,7 +385,7 @@ def _build_outline(matches: list[dict[str, Any]], source: str) -> str | None:
         if next_idx < len(lines):
             nl = lines[next_idx].lstrip()
             if nl.startswith(('"""', "'''", "/**", "//", "#")):
-                outline_chunks.append(lines[next_idx])
+                outline_chunks.append(shown[next_idx])
         outline_chunks.append(OUTLINE_MARKER)
 
     if not outline_chunks:

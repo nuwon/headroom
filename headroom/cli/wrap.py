@@ -935,6 +935,50 @@ _retired_context_tool_option = click.option(
 )
 
 
+def _env_seed_callback(env_name: str) -> Callable[[Any, Any, str | None], str | None]:
+    """Click callback that exports a non-empty option value to ``env_name``.
+
+    ``headroom wrap`` copies ``os.environ`` into the proxy subprocess and into the
+    restart-on-mismatch check, so exporting here is the whole pass-through.
+    """
+
+    def _callback(ctx: Any, param: Any, value: str | None) -> str | None:
+        if value:
+            os.environ[env_name] = value.strip().lower()
+        return value
+
+    return _callback
+
+
+def _intelligence_options(command: Callable[..., Any]) -> Callable[..., Any]:
+    """Add ``--intelligence`` / ``--jevk5`` to a wrap subcommand (not exposed)."""
+
+    command = click.option(
+        "--jevk5",
+        type=click.Choice(["auto", "on", "off"], case_sensitive=False),
+        default=None,
+        expose_value=False,
+        callback=_env_seed_callback("HEADROOM_JEVK5"),
+        help=(
+            "Optional local JevK5 decision model via llama.cpp: auto (use when "
+            "available), on (set up and start it), off. (env: HEADROOM_JEVK5)"
+        ),
+    )(command)
+    return click.option(
+        "--intelligence",
+        type=click.Choice(["off", "safe", "full"], case_sensitive=False),
+        default=None,
+        expose_value=False,
+        callback=_env_seed_callback("HEADROOM_INTELLIGENCE"),
+        help=(
+            "Context-intelligence posture for the proxy: off, safe (task-aware "
+            "relevance, invariant guard, arbiter, indexed retrieval) or full "
+            "(adds delta encoding, admission, budget allocator, tool catalog). "
+            "(env: HEADROOM_INTELLIGENCE)"
+        ),
+    )(command)
+
+
 def _should_purge_context_tools(ctx: click.Context) -> bool:
     """Whether this invocation should run the retired-context-tool cleanup.
 
@@ -3965,6 +4009,7 @@ def _agent_savings_config_mismatches(
             "bool",
         ),
         ("HEADROOM_ACCURACY_GUARD", "accuracy_guard", "accuracy-guard", "str"),
+        ("HEADROOM_INTELLIGENCE", "intelligence", "intelligence", "intelligence"),
     )
 
     mismatches: list[str] = []
@@ -3980,6 +4025,10 @@ def _agent_savings_config_mismatches(
                 matches = actual is not None and int(actual) == int(expected)
             elif value_type == "bool":
                 matches = actual is not None and bool(actual) is _env_bool_value(expected)
+            elif value_type == "intelligence":
+                from headroom.intelligence.config import parse_level
+
+                matches = parse_level(str(actual or "")) == parse_level(expected)
             else:
                 matches = str(actual or "").strip().lower() == expected.strip().lower()
         except (TypeError, ValueError):
@@ -5681,6 +5730,7 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @_serena_instructions_option
 # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
 @proxy_port_option("--port")
@@ -6286,6 +6336,7 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -7028,6 +7079,7 @@ def _run_codex_wrap(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @_serena_instructions_option
 @proxy_port_option()
 @click.option(
@@ -7139,6 +7191,7 @@ def codex(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option(
     "--code-graph",
@@ -7219,6 +7272,7 @@ def aider(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option(
     "--code-graph",
@@ -7288,6 +7342,7 @@ def vibe(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option(
     "--code-graph",
@@ -7379,6 +7434,7 @@ def kimi(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @_serena_instructions_option
 @proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
@@ -7509,6 +7565,7 @@ def grok(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -7566,6 +7623,7 @@ def cursor(
 
 @wrap.command("grok-build", context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -7634,6 +7692,7 @@ def grok_build(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -7697,6 +7756,7 @@ def cline(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -7761,6 +7821,7 @@ def zcode(
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -7837,6 +7898,7 @@ def continue_dev(
 
 @wrap.command("openclaw")
 @_retired_context_tool_option
+@_intelligence_options
 @click.option(
     "--plugin-path",
     type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
@@ -8100,6 +8162,7 @@ def openclaw(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @_serena_instructions_option
 @proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
@@ -8633,6 +8696,7 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
+@_intelligence_options
 @proxy_port_option()
 @click.option(
     "--code-graph",
@@ -8907,6 +8971,7 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
         ),
         proxy_port_option(),
         _retired_context_tool_option,
+        _intelligence_options,
     ):
         command = decorator(command)
     return click.command(target.name, context_settings={"ignore_unknown_options": True})(command)

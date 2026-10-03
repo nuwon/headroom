@@ -40,10 +40,9 @@ use super::bm25::BM25Scorer;
 use super::embedding::EmbeddingScorer;
 
 // Regex patterns that indicate exact-match is important.
-// Translated literally from Python `hybrid.py:53-60`. The `[A-Z|a-z]`
-// in the email pattern is a Python typo — `|` inside `[...]` becomes
-// a literal pipe character, not alternation. We mirror that quirk
-// faithfully for parity.
+// Translated literally from Python `hybrid.py:53-60` (the email TLD class
+// is `[A-Za-z]` on both sides; it was once `[A-Z|a-z]`, which also
+// accepted a literal `|`).
 
 static UUID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -59,11 +58,8 @@ static HOSTNAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static EMAIL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    // Python: r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
-    // The `|` inside `[A-Z|a-z]` is a literal pipe in Python — keep
-    // for byte-for-byte parity even though it's a Python source bug.
-    Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
-        .expect("email regex compiles")
+    // Python: r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+    Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b").expect("email regex compiles")
 });
 
 pub struct HybridScorer {
@@ -78,8 +74,11 @@ pub struct HybridScorer {
 }
 
 impl Default for HybridScorer {
+    /// BM25 + the process-wide embedding scorer. Without
+    /// `HEADROOM_RUST_EMBEDDINGS` (or in a lexical-only build) the
+    /// embedding side is unloaded and this is the BM25-fallback scorer.
     fn default() -> Self {
-        let embedding = EmbeddingScorer::default();
+        let embedding = EmbeddingScorer::shared();
         let embedding_available = embedding.is_available();
         HybridScorer {
             base_alpha: 0.5,
@@ -93,7 +92,7 @@ impl Default for HybridScorer {
 
 impl HybridScorer {
     pub fn new(alpha: f64, adaptive: bool) -> Self {
-        let embedding = EmbeddingScorer::default();
+        let embedding = EmbeddingScorer::shared();
         let embedding_available = embedding.is_available();
         HybridScorer {
             base_alpha: alpha,

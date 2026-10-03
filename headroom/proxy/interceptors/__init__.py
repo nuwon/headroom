@@ -22,7 +22,25 @@ from .base import (
     register,
 )
 
+
+def enable_rich_interception(enabled: bool = True) -> None:
+    """Turn on rich interception (Optimization 14) at the composition root.
+
+    Adds the test-runner interceptor and makes the ast-grep Read outline store
+    the exact original in CCR (verified) with a retrieval marker.
+    """
+    from . import astgrep as _astgrep
+    from . import test_runner as _test_runner
+
+    _astgrep.set_rich_mode(enabled)
+    if enabled:
+        _test_runner.enable()
+    else:
+        _test_runner.disable()
+
+
 __all__ = [
+    "enable_rich_interception",
     "INTERCEPTORS",
     "InterceptionResult",
     "ToolResultInterceptor",

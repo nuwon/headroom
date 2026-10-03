@@ -74,6 +74,9 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 CCR_TOOL_NAME = "headroom_retrieve"
+
+from .tool_injection import _SEARCH_DESCRIPTION_SUFFIX, _search_properties  # noqa: E402
+
 COMPRESS_TOOL_NAME = "headroom_compress"
 STATS_TOOL_NAME = "headroom_stats"
 READ_TOOL_NAME = "headroom_read"
@@ -485,16 +488,50 @@ class HeadroomMCPServer:
             "note": f"Original stored with hash={hash_key}. Use mcp__headroom__{CCR_TOOL_NAME} to get full content later.",
         }
 
+    async def _search_enabled(self) -> bool:
+        """Advertise indexed retrieval when this process or the proxy enables it."""
+        cached = getattr(self, "_search_enabled_cache", None)
+        if cached is not None:
+            return bool(cached)
+        enabled = False
+        try:
+            from headroom.intelligence.config import IntelligenceConfig
+
+            enabled = IntelligenceConfig.from_env().ccr_search
+        except Exception:  # noqa: BLE001
+            enabled = False
+        if not enabled and self.check_proxy and HTTPX_AVAILABLE:
+            try:
+                if self._http_client is None:
+                    self._http_client = httpx.AsyncClient(timeout=15.0)
+                resp = await self._http_client.get(
+                    f"{self.proxy_url}/v1/intelligence/status", timeout=1.5
+                )
+                if resp.status_code == 200:
+                    enabled = bool(((resp.json() or {}).get("config") or {}).get("ccr_search"))
+            except Exception:  # noqa: BLE001 - proxy down/old: keep the classic schema
+                enabled = False
+        self._search_enabled_cache = enabled
+        return enabled
+
     async def _retrieve_content(
         self,
         hash_key: str,
+        args: Any = None,
     ) -> dict[str, Any]:
         """Retrieve content by hash. Checks local store first, then proxy.
 
-        Retrieval is by hash and always returns the full original content.
+        Without selective ``args`` (or with ``mode="full"``) this returns the
+        exact full original content; a ``query``/``range``/``metadata``
+        request is answered from the span index over that exact original.
         """
         # Check local store first
         store = self._get_local_store()
+        if args is not None and getattr(args, "selective", False):
+            selective = store.retrieve_selective(hash_key, args)
+            if selective is not None:
+                self._stats.record_retrieval(hash_key)
+                return {**selective, "source": "local"}
         entry_status = store.get_entry_status(hash_key, clean_expired=False)
         entry = store.retrieve(hash_key)
         expired_entry_status = None
@@ -525,7 +562,11 @@ class HeadroomMCPServer:
         # Fall back to proxy if available
         if self.check_proxy and HTTPX_AVAILABLE:
             try:
-                result = await self._retrieve_via_proxy(hash_key)
+                result = (
+                    await self._retrieve_via_proxy(hash_key, args)
+                    if args is not None and getattr(args, "selective", False)
+                    else await self._retrieve_via_proxy(hash_key)
+                )
                 if "error" not in result:
                     result["source"] = "proxy"
                     self._stats.record_retrieval(hash_key)
@@ -566,13 +607,24 @@ class HeadroomMCPServer:
     async def _retrieve_via_proxy(
         self,
         hash_key: str,
+        args: Any = None,
     ) -> dict[str, Any]:
-        """Retrieve full content by hash via proxy's HTTP endpoint."""
+        """Retrieve content by hash via the proxy's HTTP endpoint."""
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=15.0)
 
         url = f"{self.proxy_url}/v1/retrieve"
-        payload: dict[str, str] = {"hash": hash_key}
+        payload: dict[str, Any] = {"hash": hash_key}
+        if args is not None and getattr(args, "selective", False):
+            payload.update(
+                {
+                    "mode": args.mode,
+                    "query": args.query,
+                    "top_k": args.top_k,
+                    "cursor": args.cursor,
+                    "range": args.range,
+                }
+            )
 
         response = await self._http_client.post(url, json=payload)
 
@@ -640,6 +692,7 @@ class HeadroomMCPServer:
 
         @self.server.list_tools()
         async def list_tools() -> list[Tool]:
+            search_enabled = await self._search_enabled()
             tools = [
                 Tool(
                     name=COMPRESS_TOOL_NAME,
@@ -671,6 +724,7 @@ class HeadroomMCPServer:
                         "Use this when you need full details from previously compressed content. "
                         "The hash comes from headroom_compress results or from compression "
                         "markers like [N items compressed... hash=abc123]."
+                        + (_SEARCH_DESCRIPTION_SUFFIX if search_enabled else "")
                     ),
                     inputSchema={
                         "type": "object",
@@ -679,6 +733,7 @@ class HeadroomMCPServer:
                                 "type": "string",
                                 "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
                             },
+                            **(_search_properties() if search_enabled else {}),
                         },
                         "required": ["hash"],
                     },
@@ -861,8 +916,11 @@ class HeadroomMCPServer:
                 )
             ]
 
-        logger.info("event=mcp_retrieve_started hash=%s", hash_key)
-        result = await self._retrieve_content(hash_key)
+        from .span_index import normalize_args
+
+        retrieve_args = normalize_args(arguments, str(hash_key).lower())
+        logger.info("event=mcp_retrieve_started hash=%s mode=%s", hash_key, retrieve_args.mode)
+        result = await self._retrieve_content(hash_key, retrieve_args)
         logger.info(
             "event=mcp_retrieve_completed hash=%s result=%s",
             hash_key,
