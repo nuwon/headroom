@@ -231,6 +231,8 @@ class IntelligencePrepTransform(Transform):
         # task query) must reproduce the same bytes or the prompt cache busts.
         self._memo: OrderedDict[tuple[str, str], tuple[str, str] | None] = OrderedDict()
         self._memo_lock = threading.Lock()
+        # Tool calls already observed (feedback re-access signals fire once).
+        self._observed_calls: OrderedDict[str, None] = OrderedDict()
 
     def should_apply(
         self, messages: list[dict[str, Any]], tokenizer: Tokenizer, **kwargs: Any
@@ -272,6 +274,18 @@ class IntelligencePrepTransform(Transform):
         for ref in list(iter_tool_results(messages, call_index)):
             env = envelope_for(ref, task.workspace_key)
             res = env.resource
+            if self._feedback is not None and res is not None and ref.call_id:
+                with self._memo_lock:
+                    first_sighting = ref.call_id not in self._observed_calls
+                    if first_sighting:
+                        self._observed_calls[ref.call_id] = None
+                        while len(self._observed_calls) > self._MEMO_MAX:
+                            self._observed_calls.popitem(last=False)
+                if first_sighting:
+                    try:
+                        self._feedback.observe_access(res)
+                    except Exception:  # noqa: BLE001
+                        pass
             prior = seen.get(res.identity) if res is not None else None
             if res is not None and not self._is_compressed(ref.text):
                 # Only a complete, uncompressed occurrence can be a delta base.
@@ -305,9 +319,16 @@ class IntelligencePrepTransform(Transform):
                 self._refresh_store(ref, text, tokenizer, kwargs)
             out = replace_tool_result_text(out, ref, text)
             applied.append(tag)
-            if self._feedback is not None and res is not None:
+            if self._feedback is not None and res is not None and not pinned:
                 try:
                     self._feedback.observe_rewrite(res, tag)
+                    from .feedback import feature_key
+                    from .invariants import ccr_hashes_in
+
+                    for h in ccr_hashes_in(text):
+                        self._feedback.note_compressed(
+                            h, feature_key(ref.tool_name, tag, kind=res.kind)
+                        )
                 except Exception:  # noqa: BLE001
                     pass
 

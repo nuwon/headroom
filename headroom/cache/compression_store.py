@@ -521,6 +521,7 @@ class CompressionStore:
         if self._enable_feedback:
             self.process_pending_feedback()
 
+        _notify_retrieval_listeners(result_entry, retrieval_type)
         return result_entry
 
     def retrieve_selective(
@@ -1167,6 +1168,48 @@ _request_ccr_store: ContextVar[CompressionStore | None] = ContextVar(
 # Global store instance (lazy initialization)
 _compression_store: CompressionStore | None = None
 _store_lock = threading.Lock()
+
+
+# Retrieval listeners (e.g. the intelligence layer's retention learner). They
+# receive payload-free metadata only — never original or compressed content —
+# and run after the store lock is released. A failing listener is ignored.
+_RETRIEVAL_LISTENERS: list[Any] = []
+_RETRIEVAL_LISTENERS_LOCK = threading.Lock()
+
+
+def add_retrieval_listener(listener: Any) -> None:
+    """Register ``listener(info: dict)`` for every successful retrieval (idempotent)."""
+    with _RETRIEVAL_LISTENERS_LOCK:
+        if listener not in _RETRIEVAL_LISTENERS:
+            _RETRIEVAL_LISTENERS.append(listener)
+
+
+def remove_retrieval_listener(listener: Any) -> None:
+    with _RETRIEVAL_LISTENERS_LOCK:
+        if listener in _RETRIEVAL_LISTENERS:
+            _RETRIEVAL_LISTENERS.remove(listener)
+
+
+def _notify_retrieval_listeners(entry: CompressionEntry, retrieval_type: str) -> None:
+    with _RETRIEVAL_LISTENERS_LOCK:
+        listeners = list(_RETRIEVAL_LISTENERS)
+    if not listeners:
+        return
+    info = {
+        "hash": entry.hash,
+        "tool_name": entry.tool_name,
+        "compression_strategy": entry.compression_strategy,
+        "tool_signature_hash": entry.tool_signature_hash,
+        "retrieval_type": retrieval_type,
+        "created_at": entry.created_at,
+        "original_tokens": entry.original_tokens,
+        "compressed_tokens": entry.compressed_tokens,
+    }
+    for listener in listeners:
+        try:
+            listener(info)
+        except Exception:  # noqa: BLE001 - observers never break retrieval
+            logger.debug("retrieval listener failed", exc_info=True)
 
 
 def set_request_compression_store(store: CompressionStore | None) -> None:
