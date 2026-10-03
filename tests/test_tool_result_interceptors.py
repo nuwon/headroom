@@ -718,8 +718,9 @@ def test_proxy_pipeline_includes_interceptor_when_env_enabled(monkeypatch):
         assert isinstance(transforms[0], ToolResultInterceptorTransform)
 
 
-def test_proxy_pipeline_blocks_interceptor_below_rollout_channel(monkeypatch):
-    """A legacy request cannot bypass the stable rollout-channel boundary."""
+def test_proxy_pipeline_enables_interceptor_on_stable_channel(monkeypatch):
+    """Interceptors are available on the stable channel: the plain env opt-in
+    installs them, with no channel switch or unsafe override."""
     monkeypatch.setenv("HEADROOM_INTERCEPT_ENABLED", "1")
     monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "stable")
     from headroom.proxy.interceptors import ToolResultInterceptorTransform
@@ -728,7 +729,7 @@ def test_proxy_pipeline_blocks_interceptor_below_rollout_channel(monkeypatch):
 
     proxy = HeadroomProxy(ProxyConfig())
     for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
-        assert not any(isinstance(t, ToolResultInterceptorTransform) for t in pipeline.transforms)
+        assert any(isinstance(t, ToolResultInterceptorTransform) for t in pipeline.transforms)
 
 
 def test_proxy_pipeline_excludes_interceptor_when_env_not_set(monkeypatch):

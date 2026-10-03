@@ -656,6 +656,20 @@ class CompressionStore:
             json.dumps(event, ensure_ascii=False, separators=(",", ":")),
         )
 
+    def verify_exact(self, hash_key: str, original: str) -> bool:
+        """Self-test: does ``hash_key`` hold exactly ``original``?
+
+        Used to prove a just-written entry is retrievable before any caller
+        advertises recovery for it. Unlike :meth:`retrieve` it records no
+        access and emits no retrieval event, so it never reads as a "the model
+        needed more" feedback signal.
+        """
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return False
+            return entry.original_content == original
+
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool:
         """Check if a hash key exists and is not expired.
 

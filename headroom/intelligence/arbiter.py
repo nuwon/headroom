@@ -75,6 +75,9 @@ class Candidate:
     tier: int = TIER_AGGRESSIVE
     lossless: bool = False
     latency_ms: float = 0.0
+    # Part of ``content`` that makes claims about the current content (see
+    # validate_candidate). None = the whole candidate.
+    claims_text: str | None = None
     # Filled by ArbiterSession.prepare()
     original_tokens: int = 0
     candidate_tokens: int = 0
@@ -218,6 +221,7 @@ class ArbiterSession:
             candidate_tokens=cand.candidate_tokens,
             lossless=cand.lossless,
             store_has=self.store_has,
+            claims_text=cand.claims_text,
         )
         cand.report = report
         marker_valid = "retrieval_marker_unresolvable" not in report.violations

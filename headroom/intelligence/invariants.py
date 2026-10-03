@@ -224,8 +224,15 @@ def validate_candidate(
     lossless: bool = False,
     store_has: Callable[[str], bool] | None = None,
     is_original: bool = False,
+    claims_text: str | None = None,
 ) -> InvariantReport:
-    """Validate ``candidate`` against the invariants of ``original``."""
+    """Validate ``candidate`` against the invariants of ``original``.
+
+    ``claims_text`` is the part of the candidate that asserts facts about the
+    *current* content (defaults to the whole candidate). A delta passes its
+    added/context lines only: its ``- `` lines are labelled base content, so a
+    value that changed between versions is not a fabricated value.
+    """
     if is_original or candidate == original:
         return InvariantReport(True, 1.0, True, True, True, True)
 
@@ -261,7 +268,7 @@ def validate_candidate(
 
     # --- values that must not change ------------------------------------
     numeric_ok = True
-    cand_values = strip_annotations(candidate)
+    cand_values = strip_annotations(candidate if claims_text is None else claims_text)
     orig_exit = set(invariants.exit_codes)
     cand_exit = set(_EXIT_CODE_RE.findall(cand_values))
     if cand_exit - orig_exit and orig_exit:
