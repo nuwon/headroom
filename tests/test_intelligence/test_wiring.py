@@ -483,3 +483,24 @@ def test_tool_catalog_adapter_skips_native_deferral_and_compacts(installed):
         "tools": [*copy.deepcopy(tools), {"type": "tool_search_tool_bm25"}],
     }
     assert apply_tool_catalog(deferred, "openai_chat", cache_cold=True) == []
+
+
+def test_codex_workspace_from_environment_context():
+    from headroom.intelligence.responses import codex_workspace
+
+    items = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "<environment_context>\n  <cwd>C:\\Users\\dev\\RepoA</cwd>\n  <shell>powershell</shell>\n</environment_context>",
+                }
+            ],
+        },
+        _user("fix the bug"),
+    ]
+    assert codex_workspace(items) == "c:/users/dev/repoa"
+    assert codex_workspace([_user("no context")]) == ""
+    assert codex_workspace("not a list") == ""

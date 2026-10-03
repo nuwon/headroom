@@ -1612,6 +1612,11 @@ class AnthropicHandlerMixin:
             # fallback id — on one shared tracker their interleaved histories
             # thrash the frozen-prefix state and the provider prompt cache is
             # re-written on nearly every call.
+            # Per-project key for the intelligence layer's code graph, so one
+            # local proxy serving several repos never mixes their symbols.
+            _intel_workspace_key = ""
+            if getattr(getattr(self, "intelligence", None), "graphs", None) is not None:
+                _intel_workspace_key = self._resolve_ccr_workspace(request, body)[0]
             prefix_tracker = self.session_tracker_store.resolve_tracker(
                 session_id,
                 "anthropic",
@@ -1898,6 +1903,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     protect=protect,
                                     request_id=request_id,
+                                    workspace_key=_intel_workspace_key,
                                     compression_policy=compression_policy,
                                     cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
@@ -1945,6 +1951,7 @@ class AnthropicHandlerMixin:
                                             biases=biases,
                                             protect=protect,
                                             request_id=request_id,
+                                            workspace_key=_intel_workspace_key,
                                             compression_policy=compression_policy,
                                             cache_ttl_seconds=_cc_ttl,
                                             skip_kompress=True,
@@ -1998,6 +2005,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         protect=protect,
                                         request_id=request_id,
+                                        workspace_key=_intel_workspace_key,
                                         compression_policy=compression_policy,
                                         cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
@@ -2042,6 +2050,7 @@ class AnthropicHandlerMixin:
                                     biases=biases,
                                     protect=protect,
                                     request_id=request_id,
+                                    workspace_key=_intel_workspace_key,
                                     compression_policy=compression_policy,
                                     cache_ttl_seconds=_cc_ttl,
                                     **proxy_pipeline_kwargs(self.config),
@@ -2105,6 +2114,7 @@ class AnthropicHandlerMixin:
                                         biases=biases,
                                         protect=protect,
                                         request_id=request_id,
+                                        workspace_key=_intel_workspace_key,
                                         compression_policy=compression_policy,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),

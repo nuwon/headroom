@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -64,6 +65,29 @@ class ResponsesTurn:
     prep_tags: list[str] = field(default_factory=list)
 
 
+_CWD_RE = re.compile(r"<cwd>\s*([^<\n]{1,1024}?)\s*</cwd>")
+
+
+def codex_workspace(items: Any) -> str:
+    """Workspace key from Codex's ``<environment_context><cwd>…</cwd>`` block."""
+    if not isinstance(items, list):
+        return ""
+    for item in items:
+        if not isinstance(item, dict) or item.get("type", "message") != "message":
+            continue
+        content = item.get("content")
+        parts = content if isinstance(content, list) else [{"text": content}]
+        for part in parts:
+            text = part.get("text") if isinstance(part, dict) else None
+            if isinstance(text, str) and "<cwd>" in text:
+                m = _CWD_RE.search(text)
+                if m:
+                    from .resources import canonical_path
+
+                    return canonical_path(m.group(1))
+    return ""
+
+
 def _text_key(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:32]
 
@@ -89,7 +113,10 @@ class ResponsesIntelligence:
             if not messages:
                 return None
             kwargs = self.runtime.prepare_request(
-                messages, {"request_id": request_id}, provider="openai", model=model
+                messages,
+                {"request_id": request_id, "workspace_key": codex_workspace(items)},
+                provider="openai",
+                model=model,
             )
             query = str(kwargs.get("context") or "") if cfg.task_query else ""
             return ResponsesTurn(
