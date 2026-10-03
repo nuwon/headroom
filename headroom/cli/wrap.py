@@ -3047,6 +3047,19 @@ def _codex_session_launch_settings(
     # without its shared background server (#3888). Say so up front, and point
     # at the persistent alternative that leaves the shared server in play.
     display.append(_CODEX_EMBEDDED_MODE_NOTE)
+    # Phase 2: PreToolUse hook for the agent-state validator / scope firewall,
+    # enabled for this session only via ``features.hooks``.
+    from headroom.intelligence.agent_state import install as _agent_state_install
+
+    _codex_hooks_file = _codex_home_dir() / "hooks.json"
+    if _agent_state_install.hooks_wanted(env):
+        try:
+            _agent_state_install.ensure_codex_hook(_codex_hooks_file, port)
+            overrides.append("features.hooks=true")
+        except OSError:
+            pass  # observe-only: the proxy still validates from history
+    else:
+        _agent_state_install.remove_codex_hook(_codex_hooks_file)
     config_args = tuple(item for override in overrides for item in ("--config", override))
     return (*config_args, *codex_args), env, display
 
@@ -6113,6 +6126,15 @@ def claude(
         # no hook of its own, so a session that only ran `wrap` (never `init`)
         # had nothing to clear a dead-proxy base_url. SessionStart-only.
         _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
+        # Phase 2: PreToolUse hook so the tool-contract validator and scope
+        # firewall get real pre-execution control (fail-open when the proxy is
+        # down). Removed again when both features are off.
+        from headroom.intelligence.agent_state import install as _agent_state_install
+
+        if _agent_state_install.hooks_wanted(env):
+            _agent_state_install.ensure_claude_hook(_wrap_settings_path, actual_port)
+        else:
+            _agent_state_install.remove_claude_hook(_wrap_settings_path)
 
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
@@ -6278,6 +6300,10 @@ def unwrap_claude(
     _unwrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
     if _remove_claude_wrap_selfheal_hook(_unwrap_settings_path):
         click.echo("  Removed Headroom wrap self-heal SessionStart hook (issue #2221).")
+    from headroom.intelligence.agent_state import install as _agent_state_install
+
+    if _agent_state_install.remove_claude_hook(_unwrap_settings_path):
+        click.echo("  Removed Headroom agent-state PreToolUse hook.")
     for _foundry, _vertex in ((False, False), (True, False), (False, True)):
         _key = _claude_wrap_base_url_env_key(foundry_mode=_foundry, vertex_mode=_vertex)
         _marker = _read_wrap_marker(_unwrap_settings_path)
@@ -8640,6 +8666,10 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     except Exception as e:  # pragma: no cover - filesystem-level errors
         raise click.ClickException(f"could not unwrap Codex config: {e}") from e
 
+    from headroom.intelligence.agent_state import install as _agent_state_install
+
+    if _agent_state_install.remove_codex_hook(_codex_home_dir() / "hooks.json"):
+        click.echo("  Removed Headroom agent-state PreToolUse hook from hooks.json.")
     if status == "restored":
         click.echo(f"  Restored prior {config_file} from pre-wrap backup.")
     elif status == "cleaned":

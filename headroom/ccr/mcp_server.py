@@ -78,6 +78,7 @@ CCR_TOOL_NAME = "headroom_retrieve"
 from .tool_injection import _SEARCH_DESCRIPTION_SUFFIX, _search_properties  # noqa: E402
 
 COMPRESS_TOOL_NAME = "headroom_compress"
+WORKFLOW_TOOL_NAME = "headroom_workflow"
 STATS_TOOL_NAME = "headroom_stats"
 READ_TOOL_NAME = "headroom_read"
 
@@ -394,6 +395,10 @@ class HeadroomMCPServer:
         self._compressor_initialized = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
+        # headroom_workflow listing is computed once per MCP session so the
+        # tools prefix the client caches never changes mid-session.
+        self._workflow_spec: dict[str, Any] | None = None
+        self._workflow_spec_cached = False
 
         if not MCP_AVAILABLE or Server is None:
             raise ImportError("MCP SDK not installed. Install with: pip install mcp")
@@ -786,6 +791,12 @@ class HeadroomMCPServer:
                     )
                 )
 
+            # Phase 2: one workflow-macro tool, listed only when this workspace
+            # has an eligible (read-only/verification) macro.
+            workflow_spec = await self._workflow_tool_spec()
+            if workflow_spec is not None:
+                tools.append(Tool(**workflow_spec))
+
             return tools
 
         @self.server.call_tool()
@@ -805,6 +816,8 @@ class HeadroomMCPServer:
                     result = await self._handle_stats()
                 elif name == READ_TOOL_NAME and _READ_ENABLED:
                     result = await self._handle_read(arguments)
+                elif name == WORKFLOW_TOOL_NAME:
+                    result = await self._handle_workflow(arguments)
                 else:
                     result = [
                         TextContent(
@@ -831,6 +844,28 @@ class HeadroomMCPServer:
                         text=json.dumps({"error": str(e)}),
                     )
                 ]
+
+    async def _workflow_tool_spec(self) -> dict[str, Any] | None:
+        """``headroom_workflow`` definition for this workspace, or None. Never raises."""
+        if self._workflow_spec_cached:
+            return self._workflow_spec
+        self._workflow_spec_cached = True
+        try:
+            from headroom.intelligence.agent_state import mcp as agent_state_mcp
+
+            macros = await asyncio.to_thread(agent_state_mcp.eligible)
+            self._workflow_spec = agent_state_mcp.tool_spec(macros)
+        except Exception:  # noqa: BLE001 - the other tools must still list
+            logger.debug("workflow tool listing failed", exc_info=True)
+            self._workflow_spec = None
+        return self._workflow_spec
+
+    async def _handle_workflow(self, arguments: dict[str, Any]) -> list[TextContent]:
+        """Run a workflow macro locally (agent's cwd, environment and privileges)."""
+        from headroom.intelligence.agent_state import mcp as agent_state_mcp
+
+        text = await asyncio.to_thread(agent_state_mcp.run, arguments or {})
+        return [TextContent(type="text", text=text)]
 
     async def _handle_compress(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle headroom_compress tool call."""

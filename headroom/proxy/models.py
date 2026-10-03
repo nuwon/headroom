@@ -281,6 +281,13 @@ class ProxyConfig:
     # HEADROOM_JEVK5* or the --intelligence / --jevk5 CLI flags.
     intelligence: Any = None
 
+    # Phase 2 agent-state layer
+    # (headroom.intelligence.agent_state.config.AgentStateConfig): task state,
+    # evidence, tool contracts, scope firewall, test impact, workflow macros.
+    # None = resolved from HEADROOM_TASK_STATE / ... and the rollout snapshot at
+    # proxy construction; every feature is stable and on by default.
+    agent_state: Any = None
+
     # Per-tool compression profiles
     tool_profiles: dict[str, Any] | None = None
 

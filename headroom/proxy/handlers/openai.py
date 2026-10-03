@@ -3107,6 +3107,70 @@ class OpenAIHandlerMixin:
             logger.debug("[%s] Responses intelligence skipped", request_id, exc_info=True)
             return None
 
+    async def _observe_agent_state_ws_payload(self, payload: Any, client: str | None) -> None:
+        """optimize=False: let Phase 2 observe a Codex WS ``response.create``; fail-open.
+
+        The frame is forwarded byte-for-byte; this only ingests its items so
+        hooks, evidence and workflow learning keep working (as the HTTP path does).
+        """
+        service = getattr(self, "agent_state", None)
+        if service is None or not isinstance(payload, dict):
+            return
+        if not isinstance(payload.get("input"), list):
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: service.begin_responses(payload, client=client or "")
+            )
+        except Exception:  # noqa: BLE001 - observation never breaks a session
+            logger.debug("agent-state WS observation skipped", exc_info=True)
+
+    def _apply_agent_state_responses(
+        self,
+        payload: dict[str, Any],
+        client_items: list[Any],
+        result: tuple[Any, ...],
+        *,
+        client: str | None,
+    ) -> tuple[Any, ...]:
+        """Phase 2 agent state for a Responses (Codex) request; fail-open.
+
+        Ingests the request's items as events and inserts the compact
+        ``<headroom_agent_state>`` message after the live turn, replaying earlier
+        insertions byte-identically (none with ``previous_response_id``, where the
+        server already holds them).
+        """
+        service = getattr(self, "agent_state", None)
+        if service is None:
+            return result
+        try:
+            rs = service.begin_responses({**payload, "input": client_items}, client=client or "")
+            if rs is None or not isinstance(result[0], dict):
+                return result
+            outgoing = result[0].get("input")
+            if not isinstance(outgoing, list):
+                return result
+            new_items = service.apply_responses(
+                rs,
+                client_items,
+                outgoing,
+                incremental=bool(payload.get("previous_response_id")),
+            )
+            if new_items is None:
+                return result
+            service.commit(rs)
+            labels = [f"openai:responses:{label}" for label in rs.labels]
+            return (
+                {**result[0], "input": new_items},
+                True,
+                result[2],
+                [*result[3], *labels],
+                *result[4:],
+            )
+        except Exception:  # noqa: BLE001 - agent state never breaks a request
+            logger.debug("agent-state responses integration skipped", exc_info=True)
+            return result
+
     def _compress_openai_responses_payload(
         self,
         payload: dict[str, Any],
@@ -3572,6 +3636,11 @@ class OpenAIHandlerMixin:
             # first frame, WS subsequent frames). Runs inside the executor
             # closure so the extra payload serialization stays off the event
             # loop.
+            # Phase 2 agent state sees the client's own items (before shaping
+            # and compression) so its insertion anchors match on later turns.
+            _as_client_items = (
+                list(payload.get("input")) if isinstance(payload.get("input"), list) else None
+            )
             shape_labels, shape_mutated = _shape_openai_responses_payload(
                 payload,
                 model=model,
@@ -3606,6 +3675,10 @@ class OpenAIHandlerMixin:
                     if unsupported_kwarg is None:
                         raise
                     compression_kwargs.pop(unsupported_kwarg)
+            if _as_client_items is not None:
+                result = self._apply_agent_state_responses(
+                    payload, _as_client_items, result, client=client
+                )
             if shape_labels:
                 # Carry the shaper labels on the transforms channel so the
                 # outcome funnel feeds the output-savings ledger
@@ -6587,6 +6660,19 @@ class OpenAIHandlerMixin:
         # CompressionUnits and routing them through ContentRouter. Policy
         # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
+        if (
+            not self.config.optimize
+            and not _bypass
+            and getattr(self, "agent_state", None) is not None
+            and isinstance(body.get("input"), list)
+        ):
+            # optimize=False never mutates the request; Phase 2 still ingests the
+            # history so hooks, evidence and workflow learning keep working.
+            _agent_state_body = body
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self.agent_state.begin_responses(_agent_state_body, client=client or ""),
+            )
         if self.config.optimize and not _bypass:
             # Pre-compression tools reference: the compression pass is
             # copy-on-write on the payload, so this still points at the
@@ -8427,6 +8513,18 @@ class OpenAIHandlerMixin:
             # anyway so a JSON-shape edge case can never break the WS
             # session.
             first_frame_rewritten = False
+            if not self.config.optimize and not _ws_bypass:
+                try:
+                    _observed = json.loads(first_msg_raw)
+                except Exception:  # noqa: BLE001 - observation is fail-open
+                    _observed = None
+                if isinstance(_observed, dict):
+                    await self._observe_agent_state_ws_payload(
+                        _observed["response"]
+                        if isinstance(_observed.get("response"), dict)
+                        else _observed,
+                        client,
+                    )
             if self.config.optimize and not _ws_bypass:
                 _first_frame_compression_elapsed_ms = 0.0
                 try:
@@ -8820,6 +8918,7 @@ class OpenAIHandlerMixin:
                                 "chatgpt_store_false" if store_forced else "bypass_header",
                             )
                         if not self.config.optimize:
+                            await self._observe_agent_state_ws_payload(inner_payload, client)
                             _log_ws_passthrough(
                                 "optimize_disabled",
                                 frame_index=frame_index,

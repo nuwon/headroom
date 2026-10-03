@@ -1,0 +1,294 @@
+---
+title: Agent State
+description: Task state, an evidence ledger, tool-call validation, a change-scope firewall, test-impact planning and learned workflow macros for Claude Code and Codex under headroom wrap.
+---
+
+Agent State is the layer above compression. Context intelligence decides
+*what the model sees*; Agent State keeps the **operational state** of a coding
+session so the model does not have to rebuild it from the transcript:
+
+- what the task is;
+- which facts are proven;
+- which tool calls will fail before they run;
+- which edits drift away from the task;
+- which tests actually need to run;
+- which repeated procedures can be done in one step.
+
+Every part is deterministic first. The optional local JevK5 model may break
+ties on a few finite questions, but it never writes state, never blocks
+anything, and is never required. No extra frontier-model calls are made.
+
+<Callout type="info" title="On by default for coding agents">
+  The six features are stable rollout flags that are enabled by default. In the
+  default `auto` mode they act on Claude Code and Codex sessions that use tools.
+  Other API clients are untouched.
+</Callout>
+
+## What each feature does
+
+| Feature | What it is | What it is not |
+|---|---|---|
+| **Task State** | A compact, typed record per task: the goal, binding constraints, acceptance criteria, decisions, progress and blockers. It is extracted from your own words and from tool results. | A conversation summary. It never rewrites what you said. |
+| **Evidence Ledger** | Atomic facts with provenance: which command exited with which code, which tests failed, file hashes, git state, compiler errors. A newer observation supersedes an older one, and a disagreement between sources is recorded as a contradiction. | CCR or RAG. It stores short facts, never file contents or full outputs. |
+| **Tool Contracts** | Checks run before a tool call executes: missing paths, bad working directories, unresolvable executables, wrong-platform commands, malformed git refs, missing test selectors and npm scripts, and narrow rules learned from repeated failures. | Schema loading. Tool schemas stay the syntax authority. |
+| **Scope Firewall** | A change contract built from the task: the files you named, your exclusions, dependencies proven by build or test failures, and the git dirty-tree baseline. It flags unrelated edits and blocks deterministic violations. | A path allowlist. Reading a file never authorizes writing it, and real dependencies are admitted with evidence. |
+| **Test Impact** | Picks the smallest useful verification set for task-owned changes, scores risk, and escalates tier by tier. It uses adapters for pytest, Cargo, CTest, Jest and Vitest. | A "run everything after every edit" policy. |
+| **Workflow Macros** | Learns repeated, successful **read-only or verification** sequences and exposes them as one `headroom_workflow` tool call. | An automation robot. Mutating, external or networked sequences are never promoted. |
+
+## How the model sees it
+
+When something material changes, Headroom adds one compact block to the
+**current** turn:
+
+```text
+<headroom_agent_state revision="17" task="T3f…" note="automated task state from Headroom (not a user message)">
+blocked:
+- B1 python -m pytest -q: 1 failing
+constraints:
+- C1 Do not change the public API.
+- C2 Must work on Windows and Linux.
+goal: Add request retries to src/pkg/core.py.
+acceptance:
+- A1 All tests must pass.
+verify:
+risk=0.48
+now: python -m pytest -q tests/test_core.py
+full-suite: not yet required
+done:
+edited src/pkg/core.py
+</headroom_agent_state>
+```
+
+A later block that builds on it carries only what changed:
+
+```text
+<headroom_agent_state changes-since="17" revision="19" task="T3f…" note="automated task state from Headroom (not a user message)">
+done:
+A1; edited src/pkg/core.py
+acceptance: none
+blocked: none
+verify: none
+</headroom_agent_state>
+```
+
+- The budgets are hard: task state 900 tokens (600 target), evidence 350,
+  scope warnings 180, verification plan 250, workflow catalog 250, and 1,200
+  for the whole block (`HEADROOM_AGENT_STATE_MAX_TOKENS`). Completed history is
+  dropped first, and warnings and blockers are dropped last.
+- **The prompt cache is preserved.** The block is added only when the state
+  materially changes. Every earlier block is re-applied byte-for-byte at its
+  original position on later turns, so the cached prefix never changes. If the
+  client compacts its history and earlier blocks disappear, the current state
+  is re-sent once.
+- **Later blocks are deltas.** Because earlier blocks stay in history, a later
+  block carries only the sections that changed, marked
+  `changes-since="<revision>"`. A section that cleared, such as a resolved
+  blocker, is written as `blocked: none`. A full block is sent again:
+  - after four deltas;
+  - when most sections changed;
+  - when the task changed;
+  - when any earlier block it builds on is missing from the history (for
+    example after compaction);
+  - on Codex requests that use `previous_response_id`, where Headroom cannot
+    see the history.
+- **Progress churn backs off.** Changes to the goal, constraints, blockers,
+  decisions or contradictions are added at once. Progress such as acceptance
+  criteria flipping during an edit-and-test loop is added at most every 6
+  requests. That interval grows by another 6 requests for every 2,000 tokens of
+  earlier blocks already in the history.
+- **Nothing is repeated.** The goal line keeps only your sentences that are
+  not already listed as a constraint, acceptance criterion or decision. A
+  one-time notice, such as a scope warning or a newly learned workflow, appears
+  once and is never re-sent just because it went away.
+- Nothing is added for a one-turn chat, when every feature is off, or with
+  `optimize` disabled. Without `optimize`, Agent State still observes the
+  session but never changes the request.
+
+## Enforcement is truthful
+
+Headroom blocks a call only where it really controls execution:
+
+| Agent | Observe calls | Block before execution | Rewrite arguments | Run `headroom_workflow` |
+|---|---|---|---|---|
+| Claude Code (`headroom wrap claude`) | yes | **yes**, via a PreToolUse hook in `.claude/settings.local.json` | no, see the note below | yes (MCP) |
+| Codex (`headroom wrap codex`) | yes | *requested*, then verified, via a PreToolUse hook in `$CODEX_HOME/hooks.json`, with `features.hooks` enabled for the session | no | yes (MCP) |
+| Any other client through the proxy (only when a feature is set to `on`) | yes, after execution | no | no | no |
+
+- A call that Headroom only sees in history has already run. Findings on it
+  are recorded as `observed`, never as `blocked`.
+- Codex does not document its hook-blocking semantics. Headroom *requests* the
+  block and switches to reporting `blocked` only after the conversation history
+  shows that a requested block was honored.
+- If a blocked call shows up as executed anyway, blocking is turned off for that
+  session.
+- **Why no argument rewriting.** Claude Code applies rewritten arguments only
+  together with an `allow` decision, and `allow` would skip your permission
+  prompt. Headroom never does that. Safe repairs, such as making a relative path
+  absolute or normalizing separators, are applied only where Headroom runs the
+  step itself, inside a workflow macro.
+- Hard blocks are limited to deterministic cases:
+  - writes or deletes outside the project, with symlinks and junctions resolved;
+  - paths you excluded;
+  - `.git` internals and installed dependencies;
+  - credential files you did not name;
+  - git-ignored generated output.
+
+  Unrelated or ambiguous edits get a warning, not a block. JevK5 alone can only
+  warn.
+- **Your words override the defaults.** Naming a file ("add the DSN to
+  `.env.local`") puts it in scope. Excluding one ("do not modify `src/legacy/`")
+  makes edits there a hard violation.
+
+## Configuration
+
+Each feature has an emergency override that takes `auto|on|off`. `auto` is the
+default.
+
+| Variable | Feature |
+|---|---|
+| `HEADROOM_TASK_STATE` | Task State |
+| `HEADROOM_EVIDENCE_LEDGER` | Evidence Ledger |
+| `HEADROOM_TOOL_CONTRACTS` | Tool Contracts |
+| `HEADROOM_SCOPE_FIREWALL` | Scope Firewall |
+| `HEADROOM_TEST_IMPACT` | Test Impact |
+| `HEADROOM_WORKFLOW_MACROS` | Workflow Macros |
+
+`HEADROOM_DISABLE_FEATURES=scope_firewall` (and the other flag names
+`task_state_compiler`, `evidence_ledger`, `tool_contract_validator`,
+`test_impact_planner`, `workflow_macro_compiler`) also turns a feature off.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HEADROOM_AGENT_STATE_MAX_TOKENS` | `1200` | Hard cap for the injected block (200–8000) |
+| `HEADROOM_TOOL_CONTRACT_MODE` | `protect` | `protect` blocks deterministic invalid calls (with a hook), `warn` only warns, `observe` only records |
+| `HEADROOM_SCOPE_MODE` | `protect` | Same modes, for scope violations |
+| `HEADROOM_WORKFLOW_MIN_OBSERVATIONS` | `3` | Observations needed to promote a macro (minimum 3) |
+| `HEADROOM_WORKFLOW_AUTO_CLASSES` | `read_only,verification` | Macro classes allowed to auto-promote. Nothing else is accepted |
+| `HEADROOM_TEST_RISK_TIER2` / `_TIER3` | `0.35` / `0.70` | Risk thresholds for running tier 2 and tier 3 |
+| `HEADROOM_AGENT_STATE_DIR` | `~/.headroom/intelligence/agent_state` | Where the per-project databases live |
+
+Invalid values stop the proxy at startup with a clear error instead of being
+ignored.
+
+PowerShell:
+
+```powershell
+$env:HEADROOM_SCOPE_MODE = "warn"
+headroom wrap claude
+```
+
+cmd:
+
+```bat
+set HEADROOM_WORKFLOW_MACROS=off
+headroom wrap codex
+```
+
+## Verification tiers
+
+The planner works only on files changed *during the task*. It takes them from
+the Scope Firewall's task-owned set and never from raw `git status`, so
+uncommitted edits you made before the task are not counted.
+
+The risk score is:
+
+```text
+R = 0.25·scope + 0.20·interface + 0.15·config/build + 0.15·failure history
+  + 0.10·platform + 0.10·evidence uncertainty + 0.05·change size
+```
+
+- **R below 0.35**: tier 1 (direct tests).
+- **0.35 to 0.70**: tier 1, then tier 2 (neighborhood tests) if tier 1 passes.
+- **0.70 or more**: tiers 1 and 2, then the full suite.
+
+Some changes always go to the full suite after the earlier tiers pass:
+
+- wire protocol or serialization code;
+- migrations;
+- authentication or authorization core;
+- dependency lockfiles;
+- root build configuration;
+- shared CLI parsing;
+- the core proxy request/response model;
+- an explicit request from you to run the full suite.
+
+A tier that fails stops the run. A test already known to be flaky gets **one**
+rerun; if the outcomes differ it is reported `FLAKY`, not passing. A failure
+that existed before the task's first change is reported but does not block
+completion.
+
+## Workflow macros
+
+- **Promotion.** A sequence is promoted only when all of these hold:
+  - it was seen at least 3 times with a success rate of at least 90%;
+  - it came from 2 sessions, or 3 uncorrected repetitions in one;
+  - it had no contract or scope finding;
+  - it saves at least 2 turns.
+- **Parameters.** Only project-relative paths that actually differed between
+  observations become parameters. Executables, flags, URLs and absolute paths
+  never do.
+- **Execution.** Every step runs as a direct argv list with your privileges,
+  passes the validator and the firewall, and records normal events and evidence.
+  The run stops at the first failing step.
+- **Disabling.** A macro is disabled after 2 failures in its last 5 runs, and
+  whenever the build or test configuration, an executable, or a referenced path
+  changes.
+
+Three generic templates (`run_test_impact_plan`, `show_task_owned_diff`,
+`verify_then_status`) exist in every project but stay disabled until the
+project has a git repository or a detected test framework.
+
+## Diagnostics
+
+```bash
+headroom intelligence state       # task id, revision, compact task state
+headroom intelligence evidence    # claim heads; --claim "tests_passing|latest"
+headroom intelligence contracts   # capability matrix, learned rules, recent checks
+headroom intelligence scope       # change contract, task-owned changes, warnings
+headroom intelligence verify      # risk, tiers, reasons; --run executes the plan
+headroom intelligence workflows   # candidate, promoted and disabled macros
+```
+
+Each command takes `--project PATH`, `--session ID` and `--json`. The proxy
+also serves `GET /v1/agent-state/status` on loopback, and
+`/v1/intelligence/status` includes the same data.
+
+## Storage, retention and privacy
+
+- There is one SQLite database per project:
+  `<state dir>/<sha256(project root)[:24]>/agent_state.sqlite3`. It uses WAL,
+  foreign keys, a 5 s busy timeout and versioned forward-only migrations.
+- A corrupt database is renamed to `*.corrupt-<time>` and kept for diagnosis,
+  never deleted.
+- A database written by a newer Headroom disables persistence instead of being
+  touched.
+- Retention:
+
+  | Data | Kept for |
+  |---|---|
+  | Completed tasks, durable evidence, learned tool rules, workflow candidates | 30 days |
+  | Volatile facts | Their TTL, plus 7 days |
+  | Impact edges | 90 days, with decay |
+  | Unused promoted macros | 90 days |
+
+  Cleanup runs at most hourly and at proxy shutdown.
+- Everything is redacted with Headroom's shared redactor before it is written.
+  That covers API keys, `Authorization`/`Cookie` values, tokens, passwords,
+  private keys, credential URLs and `.env` values. File contents and full
+  command outputs are never stored, only short facts and hashes.
+- Data never leaves your machine, and one project's data is never visible from
+  another.
+
+## Windows and Linux
+
+- Paths are compared case-insensitively on Windows and resolved through
+  symlinks and junctions before any workspace-bound decision.
+- Commands run as argv, with `.cmd` shims such as `npx.cmd` resolved, and
+  PowerShell `-Command` and `cmd /c` command lines are understood.
+- Windows children run with `CREATE_NO_WINDOW` and their own process group, and
+  timeouts kill the whole tree with `taskkill /T`.
+- Test commands keep your package manager (pnpm, yarn, bun or npm) and your
+  project's Python virtual environment.
+- The hook script uses only the standard library and the interpreter that runs
+  Headroom. If the proxy is not running it exits immediately and the agent
+  carries on.

@@ -319,7 +319,12 @@ def test_snapshot_query_and_compatibility_helpers() -> None:
     )
 
     assert snapshot.is_available("canary-probe") is True
-    assert snapshot.enabled == frozenset({"canary_probe"})
+    default_on = frozenset(
+        name
+        for name, spec in FEATURES.items()
+        if spec.default_enabled(snapshot.channel) and name != "read_maturation"
+    )
+    assert snapshot.enabled == frozenset({"canary_probe"}) | default_on
     assert snapshot.disabled == frozenset({"read_maturation"})
     assert feature_enabled(
         "canary_probe",

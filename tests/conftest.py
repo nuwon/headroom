@@ -106,6 +106,20 @@ def _disable_live_proxy_discovery(monkeypatch, _scrub_developer_headroom_env):
     monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
+# Phase 2 agent-state stores default to ~/.headroom/intelligence/agent_state.
+# Every test gets its own directory so no test reads or writes the developer's
+# real workspace databases, and no state leaks between tests.
+@pytest.fixture(autouse=True)
+def _isolate_agent_state_dir(monkeypatch, tmp_path_factory):
+    monkeypatch.setenv("HEADROOM_AGENT_STATE_DIR", str(tmp_path_factory.mktemp("agent-state")))
+    yield
+    try:
+        from headroom.intelligence.agent_state.store import close_all_stores
+    except ModuleNotFoundError:
+        return
+    close_all_stores()
+
+
 # The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
 # test that registers a server (directly or through `wrap`) writes into the
 # developer's REAL ledger — observed adding a live `claude/serena` entry during a

@@ -1081,6 +1081,12 @@ class HeadroomProxy(
             from headroom.intelligence.runtime import install_runtime
 
             install_runtime(None)
+        # Phase 2 agent-state layer (task state, evidence, contracts, scope,
+        # test impact, workflows). None when every feature is off.
+        self.agent_state = _build_agent_state(config, self.intelligence)
+        from headroom.intelligence.agent_state.runtime import install_service
+
+        install_service(self.agent_state)
 
         cache_aligner = CacheAligner(CacheAlignerConfig(enabled=False))
         anthropic_router = ContentRouter(
@@ -2359,6 +2365,10 @@ class HeadroomProxy(
             # Saves learned priors and stops a Headroom-owned llama-server.
             with contextlib.suppress(Exception):
                 self.intelligence.shutdown()
+        if getattr(self, "agent_state", None) is not None:
+            # Records SESSION_END, persists sessions, runs retention once.
+            with contextlib.suppress(Exception):
+                self.agent_state.shutdown()
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -5523,7 +5533,35 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             cfg = proxy.config.intelligence
             cfg = IntelligenceConfig.from_dict(cfg) if isinstance(cfg, dict) else cfg
             return {"config": (cfg or IntelligenceConfig()).to_dict(), "enabled": False}
-        return {"enabled": True, **runtime.status()}
+        out = {"enabled": True, **runtime.status()}
+        service = getattr(proxy, "agent_state", None)
+        if service is not None:
+            out["agent_state"] = service.status()
+        return out
+
+    @app.get("/v1/agent-state/status", dependencies=[Depends(_require_loopback)])
+    async def agent_state_status():
+        """Agent-state features, counters, latency and per-session capabilities (no payloads)."""
+        service = getattr(proxy, "agent_state", None)
+        if service is None:
+            return {"enabled": False}
+        return {"enabled": True, **service.status()}
+
+    @app.post("/v1/agent-state/hook", dependencies=[Depends(_require_loopback)])
+    async def agent_state_hook(request: Request):
+        """Host PreToolUse hook (Claude Code / Codex). Fails open: allow."""
+        service = getattr(proxy, "agent_state", None)
+        if service is None:
+            return {"decision": "allow", "enforced": "disabled"}
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return {"decision": "allow"}
+        if not isinstance(payload, dict):
+            return {"decision": "allow"}
+        return await asyncio.get_running_loop().run_in_executor(
+            None, service.on_pretool_hook, payload
+        )
 
     @app.post("/v1/intelligence/systemone", dependencies=[Depends(_require_loopback)])
     async def intelligence_systemone(request: Request):
@@ -6037,6 +6075,41 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     return app
 
 
+def _build_agent_state(config: ProxyConfig, intelligence: Any) -> Any:
+    """AgentStateService for ``config`` or None (all Phase 2 features off).
+
+    A bad override value raises :class:`AgentStateConfigError` (startup error).
+    Any other failure fails open: the proxy runs without the agent-state layer.
+    """
+    from headroom.intelligence.agent_state.config import AgentStateConfig
+
+    acfg = config.agent_state
+    if acfg is None:
+        acfg = AgentStateConfig.from_env(rollout=config.rollout)
+    elif isinstance(acfg, dict):
+        acfg = AgentStateConfig.from_dict(acfg)
+    config.agent_state = acfg
+    try:
+        from headroom.intelligence.agent_state import build_service
+
+        service = build_service(acfg, intelligence=intelligence)
+    except Exception:  # noqa: BLE001 - never block proxy startup
+        logger.warning(
+            "Agent-state layer failed to initialize; continuing without it", exc_info=True
+        )
+        return None
+    if service is not None:
+        logger.info(
+            "Agent state: %s",
+            ", ".join(
+                f"{k}={v}"
+                for k, v in acfg.to_dict().items()
+                if k in ("task_state", "evidence", "contracts", "scope", "test_impact", "workflows")
+            ),
+        )
+    return service
+
+
 def _build_intelligence_runtime(config: ProxyConfig) -> Any:
     """IntelligenceRuntime for ``config`` or None (all features off)."""
     from headroom.intelligence.config import IntelligenceConfig
@@ -6159,6 +6232,10 @@ def _proxy_config_from_env() -> ProxyConfig:
                 from headroom.intelligence.config import IntelligenceConfig
 
                 values["intelligence"] = IntelligenceConfig.from_dict(values["intelligence"])
+            if isinstance(values.get("agent_state"), dict):
+                from headroom.intelligence.agent_state.config import AgentStateConfig
+
+                values["agent_state"] = AgentStateConfig.from_dict(values["agent_state"])
             return ProxyConfig(**values)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning(
@@ -6172,9 +6249,12 @@ def _proxy_config_from_env() -> ProxyConfig:
     rollout = resolve_rollout(
         requested=("tool_result_interceptors",) if intelligence.rich_interceptors else ()
     )
+    from headroom.intelligence.agent_state.config import AgentStateConfig
+
     return ProxyConfig(
         rollout=rollout,
         intelligence=intelligence,
+        agent_state=AgentStateConfig.from_env(rollout=rollout),
         host=_get_env_str("HEADROOM_HOST", "127.0.0.1"),
         port=_get_env_int("HEADROOM_PORT", 8787),
         openai_api_url=os.environ.get("OPENAI_TARGET_API_URL"),

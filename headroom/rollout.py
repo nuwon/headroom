@@ -132,6 +132,50 @@ FEATURES: dict[str, FeatureSpec] = {
         legacy_env=("HEADROOM_CANARY_PROBE",),
         description="Policy-engine probe (no runtime behavior).",
     ),
+    # Phase 2 agent-state features. Stable and on by default; each has an
+    # auto|on|off emergency override (see headroom/intelligence/agent_state/config.py).
+    "task_state_compiler": FeatureSpec(
+        name="task_state_compiler",
+        available_in=RolloutChannel.STABLE,
+        default_enabled_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_TASK_STATE",),
+        description="Typed durable task state injected in the live turn (feature 16).",
+    ),
+    "evidence_ledger": FeatureSpec(
+        name="evidence_ledger",
+        available_in=RolloutChannel.STABLE,
+        default_enabled_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_EVIDENCE_LEDGER",),
+        description="Source-linked facts with supersession and contradiction (feature 17).",
+    ),
+    "tool_contract_validator": FeatureSpec(
+        name="tool_contract_validator",
+        available_in=RolloutChannel.STABLE,
+        default_enabled_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_TOOL_CONTRACTS",),
+        description="Semantic tool-call validation with capability-aware enforcement (feature 19).",
+    ),
+    "scope_firewall": FeatureSpec(
+        name="scope_firewall",
+        available_in=RolloutChannel.STABLE,
+        default_enabled_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_SCOPE_FIREWALL",),
+        description="Change-scope contract and drift detection (feature 23).",
+    ),
+    "test_impact_planner": FeatureSpec(
+        name="test_impact_planner",
+        available_in=RolloutChannel.STABLE,
+        default_enabled_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_TEST_IMPACT",),
+        description="Risk-tiered verification planning (feature 24).",
+    ),
+    "workflow_macro_compiler": FeatureSpec(
+        name="workflow_macro_compiler",
+        available_in=RolloutChannel.STABLE,
+        default_enabled_in=RolloutChannel.STABLE,
+        legacy_env=("HEADROOM_WORKFLOW_MACROS",),
+        description="Learned read-only/verification workflow macros (feature 20).",
+    ),
     "bedrock_openai_prompt_caching": FeatureSpec(
         name="bedrock_openai_prompt_caching",
         available_in=RolloutChannel.STABLE,
