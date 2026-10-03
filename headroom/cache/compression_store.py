@@ -210,7 +210,7 @@ class RetrievalEvent:
     total_items: int
     tool_name: str | None
     timestamp: float
-    retrieval_type: str  # always "full" (retrieval is by hash)
+    retrieval_type: str  # "full", or a selective mode: "search" | "range" | "metadata"
     tool_signature_hash: str | None = None  # For TOIN correlation
 
 
@@ -459,12 +459,17 @@ class CompressionStore:
         self,
         hash_key: str,
         query: str | None = None,
+        *,
+        retrieval_type: str = "full",
     ) -> CompressionEntry | None:
         """Retrieve original content by hash.
 
         Args:
             hash_key: Hash key returned by store().
             query: Optional query for feedback tracking.
+            retrieval_type: ``full`` (default) or the selective mode
+                (``search``/``range``/``metadata``) the caller is serving;
+                recorded on the retrieval event for feedback learning.
 
         Returns:
             CompressionEntry if found and not expired, None otherwise.
@@ -494,13 +499,13 @@ class CompressionStore:
                     items_retrieved=entry.original_item_count,
                     total_items=entry.original_item_count,
                     tool_name=entry.tool_name,
-                    retrieval_type="full",
+                    retrieval_type=retrieval_type,
                     tool_signature_hash=entry.tool_signature_hash,
                 )
             self._log_retrieval_payload(
                 hash_key=hash_key,
                 query=query,
-                retrieval_type="full",
+                retrieval_type=retrieval_type,
                 payload=entry.original_content,
                 items_retrieved=entry.original_item_count,
                 total_items=entry.original_item_count,
@@ -517,6 +522,68 @@ class CompressionStore:
             self.process_pending_feedback()
 
         return result_entry
+
+    def retrieve_selective(
+        self,
+        hash_key: str,
+        args: Any,
+        *,
+        exact_terms: Any = (),
+        prior: Any = None,
+        semantic: Any = None,
+        max_chars: int = 24_000,
+    ) -> dict[str, Any] | None:
+        """Indexed/partial retrieval (``headroom.ccr.span_index``).
+
+        ``args`` is a :class:`~headroom.ccr.span_index.RetrieveArgs`. ``full``
+        mode returns the exact original, unchanged from :meth:`retrieve`;
+        ``search``/``range``/``metadata`` answer from a span index over the
+        exact original, so every returned span is a verbatim slice of it.
+        Returns ``None`` when the entry is missing or expired.
+        """
+        entry = self.retrieve(
+            hash_key, query=getattr(args, "query", None) or None, retrieval_type=args.mode
+        )
+        if entry is None:
+            return None
+        common = {
+            "original_tokens": entry.original_tokens,
+            "original_item_count": entry.original_item_count,
+            "compressed_item_count": entry.compressed_item_count,
+            "tool_name": entry.tool_name,
+            "retrieval_count": entry.retrieval_count,
+        }
+        if args.mode == "full":
+            return {
+                "hash": hash_key,
+                "mode": "full",
+                "original_content": entry.original_content,
+                **common,
+            }
+        from ..ccr.span_index import selective_retrieve
+
+        try:
+            result = selective_retrieve(
+                hash_key,
+                entry.original_content,
+                args,
+                exact_terms=exact_terms,
+                prior=prior,
+                semantic=semantic,
+                max_chars=max_chars,
+            )
+        except Exception as exc:  # noqa: BLE001 - an index failure must not lose the data
+            logger.warning(
+                "CCR selective index failed for %s (%s); serving full content", hash_key, exc
+            )
+            return {
+                "hash": hash_key,
+                "mode": "full",
+                "original_content": entry.original_content,
+                "note": "selective index unavailable; full original returned",
+                **common,
+            }
+        return {**result, **common}
 
     def get_metadata(
         self,

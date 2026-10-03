@@ -21,6 +21,69 @@ from typing import Any, Protocol, runtime_checkable
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
+# Indexed/partial retrieval (Optimization 3). Resolved once at the proxy's
+# composition root from IntelligenceConfig.ccr_search and installed here, so
+# every provider shape advertises the same optional arguments. Off keeps the
+# historical ``{hash}``-only schema byte-identical.
+_SEARCH_ENABLED = False
+
+_SEARCH_DESCRIPTION_SUFFIX = (
+    " For large outputs, prefer a targeted search: pass `query` (mode defaults to"
+    ' "search") to get only the relevant exact spans, `cursor` to page, `mode="range"`'
+    ' with `range` (e.g. "3-7") for specific spans, or `mode="metadata"` for an'
+    " index summary. Omit them to get the complete original."
+)
+
+
+def set_ccr_search_enabled(enabled: bool) -> None:
+    """Advertise the optional query/mode/top_k/cursor/range retrieve arguments."""
+    global _SEARCH_ENABLED
+    _SEARCH_ENABLED = bool(enabled)
+
+
+def ccr_search_enabled() -> bool:
+    return _SEARCH_ENABLED
+
+
+def _search_properties() -> dict[str, Any]:
+    return {
+        "query": {
+            "type": "string",
+            "description": "Optional. Return only the spans relevant to this query (exact text).",
+        },
+        "mode": {
+            "type": "string",
+            "enum": ["full", "search", "range", "metadata"],
+            "description": "Optional. full (default without query) | search | range | metadata.",
+        },
+        "top_k": {
+            "type": "integer",
+            "description": "Optional. Spans per page (default 5, max 50).",
+        },
+        "cursor": {
+            "type": "string",
+            "description": "Optional. next_cursor from a previous search page.",
+        },
+        "range": {
+            "type": "string",
+            "description": 'Optional. Span ordinals for mode=range, e.g. "0-4,9".',
+        },
+    }
+
+
+def _with_search(definition: dict[str, Any]) -> dict[str, Any]:
+    if not _SEARCH_ENABLED:
+        return definition
+    import copy
+
+    out = copy.deepcopy(definition)
+    holder = out.get("function", out)
+    holder["description"] = str(holder.get("description", "")) + _SEARCH_DESCRIPTION_SUFFIX
+    schema = holder.get("input_schema") or holder.get("parameters")
+    if isinstance(schema, dict):
+        schema.setdefault("properties", {}).update(_search_properties())
+    return out
+
 
 @runtime_checkable
 class _HashOwnershipStore(Protocol):
@@ -34,7 +97,7 @@ class _HashOwnershipStore(Protocol):
     def exists(self, hash_key: str, clean_expired: bool = False) -> bool: ...
 
 
-def create_ccr_tool_definition(
+def _base_ccr_tool_definition(
     provider: str = "anthropic",
 ) -> dict[str, Any]:
     """Create the CCR retrieval tool definition.
@@ -149,6 +212,19 @@ def create_ccr_tool_definition(
     else:
         # Default to OpenAI format
         return openai_definition
+
+
+def create_ccr_tool_definition(
+    provider: str = "anthropic",
+) -> dict[str, Any]:
+    """Create the CCR retrieval tool definition for ``provider``.
+
+    When indexed retrieval is enabled (:func:`set_ccr_search_enabled`) the
+    schema additionally advertises optional ``query``/``mode``/``top_k``/
+    ``cursor``/``range`` arguments; ``hash`` stays the only required one, so
+    ``headroom_retrieve(hash)`` keeps returning the exact full original.
+    """
+    return _with_search(_base_ccr_tool_definition(provider))
 
 
 def create_system_instructions(
@@ -653,3 +729,37 @@ def parse_tool_call(
     # marker hash uppercase passed validation but then missed the store lookup,
     # failing an otherwise-valid retrieval. Return the canonical lowercase form.
     return hash_key.lower()
+
+
+def _tool_call_input(tool_call: dict[str, Any], provider: str) -> tuple[Any, Any]:
+    if provider == "anthropic":
+        return tool_call.get("name"), tool_call.get("input", {})
+    if provider in ("openai", "openai_responses"):
+        if provider == "openai":
+            function = tool_call.get("function") or {}
+            name, raw = function.get("name"), function.get("arguments", "{}")
+        else:
+            name, raw = tool_call.get("name"), tool_call.get("arguments", "{}")
+        try:
+            return name, json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            return name, {}
+    if provider == "google":
+        function_call = tool_call.get("functionCall") or {}
+        return function_call.get("name"), function_call.get("args", {})
+    return tool_call.get("name"), tool_call.get("input", tool_call.get("args", {}))
+
+
+def parse_tool_call_args(tool_call: dict[str, Any], provider: str = "anthropic") -> Any:
+    """Like :func:`parse_tool_call` but returns the full ``RetrieveArgs``.
+
+    Returns ``None`` for anything that is not a valid CCR call. A call carrying
+    only ``hash`` yields ``mode="full"`` — the backward-compatible behavior.
+    """
+    hash_key = parse_tool_call(tool_call, provider)
+    if hash_key is None:
+        return None
+    from .span_index import normalize_args
+
+    _name, raw = _tool_call_input(tool_call, provider)
+    return normalize_args(raw if isinstance(raw, dict) else {}, hash_key)

@@ -5430,7 +5430,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 detail=format_retrieval_miss_detail(entry_status),
             )
 
-        # Retrieval is by hash: always return the full original content.
+        # Optional indexed/partial retrieval (query/mode/top_k/cursor/range).
+        # Without them the endpoint returns the exact full original, as before.
+        from headroom.ccr.span_index import normalize_args
+
+        retrieve_args = normalize_args(data if isinstance(data, dict) else {}, hash_key)
+        if retrieve_args.selective:
+            selective = store.retrieve_selective(hash_key, retrieve_args)
+            if selective is not None:
+                return selective
         entry = store.retrieve(hash_key)
         if entry:
             return {
@@ -5839,9 +5847,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "ttl_seconds": entry_status.get("ttl_seconds", entry_status["default_ttl_seconds"]),
             }
         else:
-            # Retrieval is by hash: always return the full original content.
-            entry = store.retrieve(hash_key)
-            if entry:
+            from headroom.ccr.tool_injection import parse_tool_call_args
+
+            retrieve_args = parse_tool_call_args(tool_call, provider)
+            selective = (
+                store.retrieve_selective(hash_key, retrieve_args)
+                if retrieve_args is not None and retrieve_args.selective
+                else None
+            )
+            entry = None if selective is not None else store.retrieve(hash_key)
+            if selective is not None:
+                retrieval_data = selective
+            elif entry:
                 retrieval_data = {
                     "hash": hash_key,
                     "original_content": entry.original_content,

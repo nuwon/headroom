@@ -472,7 +472,10 @@ class StreamingMixin:
             # feedback chain: _log_retrieval -> process_pending_feedback
             # -> toin.record_retrieval(). We discard the returned content.
             try:
-                store.retrieve(hash_key)
+                from headroom.ccr.span_index import normalize_args
+
+                _args = normalize_args(input_data if isinstance(input_data, dict) else {}, hash_key)
+                store.retrieve(hash_key, query=_args.query or None, retrieval_type=_args.mode)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback recording failed: {e}")
 
@@ -545,7 +548,10 @@ class StreamingMixin:
                 f"hash={hash_key[:8]}..."
             )
             try:
-                store.retrieve(hash_key)
+                from headroom.ccr.span_index import normalize_args
+
+                _args = normalize_args(input_data, hash_key)
+                store.retrieve(hash_key, query=_args.query or None, retrieval_type=_args.mode)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback (openai stream) failed: {e}")
 

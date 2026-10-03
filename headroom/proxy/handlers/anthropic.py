@@ -2666,7 +2666,9 @@ class AnthropicHandlerMixin:
                         workspace_key=ccr_workspace_key,
                     )
                     if recommendations:
-                        expansions = self.ccr_context_tracker.execute_expansions(recommendations)
+                        expansions = self.ccr_context_tracker.execute_expansions(
+                            recommendations, query=user_query
+                        )
                         if expansions:
                             # Add expanded context to the system message or as additional context.
                             # Pass workspace_label so the injected block declares its provenance
