@@ -62,12 +62,6 @@ _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 # switches put request content in the same file. That is a second line of
 # defence, not a reason to log the payload.)
 PAYLOAD_PREVIEW_ENV = "HEADROOM_LOG_PAYLOAD_PREVIEW"
-_SECRET_KEY_VALUE_RE = re.compile(
-    r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
-    r"(\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
-)
-_AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
-_API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 
 
 def _get_env_default_ttl_seconds() -> int:
@@ -113,9 +107,9 @@ def format_retrieval_miss_detail(status: dict[str, Any]) -> str:
 
 
 def _redact_retrieval_log_payload(payload: str) -> str:
-    redacted = _SECRET_KEY_VALUE_RE.sub(r"\1\2\3[REDACTED]", payload)
-    redacted = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", redacted)
-    return _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
+    from headroom.redaction import redact_text
+
+    return redact_text(payload)
 
 
 def _payload_preview_enabled() -> bool:

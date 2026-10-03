@@ -29,6 +29,12 @@ class DecisionFamily(str, Enum):
     SEMANTIC_REDUNDANCY = "semantic_redundancy"
     ADMISSION_MODE = "admission_mode"
     GRAPH_NEIGHBORHOOD = "graph_neighborhood"
+    # Phase 2 agent-state classifications (finite choices only; never authoring).
+    TASK_STATE = "task_state"
+    EVIDENCE_CONFLICT = "evidence_conflict"
+    TOOL_CONTRACT = "tool_contract"
+    SCOPE_NECESSITY = "scope_necessity"
+    TEST_IMPACT = "test_impact"
 
 
 class QuestionType(str, Enum):
