@@ -141,7 +141,7 @@ a console window on Windows.
 | Env var | Default | Meaning |
 |---|---|---|
 | `HEADROOM_JEVK5` | `auto` | `auto` uses an installed setup, `on` sets it up (download/build allowed), `off` never uses it |
-| `HEADROOM_JEVK5_URL` | — | Use an already-running llama-server instead of starting one |
+| `HEADROOM_JEVK5_URL` | — | Use an operator-managed `/v1/systemone` decision endpoint (for example `headroom intelligence gateway`) instead of starting one; Headroom never starts or stops it |
 | `HEADROOM_JEVK5_LLAMA_SERVER` | — | Explicit path to `llama-server` / `llama-server.exe` |
 | `HEADROOM_JEVK5_MODEL_REPO` / `_MODEL_FILE` | `alibiserikbay/JevK5-GGUF` / `jevk5-4b-v0.3-Q8_0.gguf` | Model to load |
 | `HEADROOM_JEVK5_GPU_LAYERS` | `auto` | `-ngl` (falls back to CPU once on out-of-memory) |
